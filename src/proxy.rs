@@ -2430,8 +2430,11 @@ fn relay_expected(app: &App, server_id: i64) -> Result<(String, String)> {
 }
 
 pub fn reconcile_relay_push(app: &App, server_id: i64) -> Result<bool> {
-    let desired = realm_desired_running(app);
+    // desired 与期望同源（=want 非空），不取全局开关：远端无腿机器的期望是
+    // 「停服务清理」，若带 true，agent 会自造占位写盘、指纹与空期望永不相等，
+    // 每 60s 心跳重推并重启 realm（占位语义三处分叉的环，2026-10-27 收口）。
     let (body, hash) = relay_expected(app, server_id)?;
+    let desired = !hash.is_empty();
     let pushed = {
         let agents = app.agents.read().unwrap_or_else(|e| e.into_inner());
         let Some(agent) = agents.get(&server_id) else { return Ok(false) };
@@ -4257,6 +4260,63 @@ mod relay_render_tests {
             "心跳后必须推 relay.apply,实际: {:?}",
             seen.lock().unwrap()
         );
+    }
+
+    /// 远端机器（无规则、非本机作用域）+ 全局中转开关开：期望是「停服务清理」，
+    /// 推送必须带 desired_running=false。若带 true，agent 会自造占位写盘，指纹
+    /// 与期望（空串）永不相等——每 60s 心跳重推一次 realm（占位语义三处分叉
+    /// 的重启环）。桩忠实模拟 agent 两种行为：空体+true=自造占位（旧版），
+    /// 空体+false=停服务清文件。三拍心跳后必须收敛：恰好推过一次、桩已清干净。
+    #[tokio::test]
+    async fn empty_relay_expectation_stops_the_service_instead_of_placeholder() {
+        let app = std::sync::Arc::new(crate::App::for_test(crate::db::Db::open(":memory:").unwrap()));
+        app.db.set("proxy_public_host", "exit.example.com").unwrap();
+        app.db.set("realm_desired_running", "on").unwrap();
+
+        // 桩的状态：它当前上报的 relay 指纹。起点是「规则刚删、盘上还有旧配置」。
+        let reported: std::sync::Arc<std::sync::Mutex<String>> =
+            std::sync::Arc::new(std::sync::Mutex::new("stale-hash-of-deleted-rule".into()));
+        let pushes: std::sync::Arc<std::sync::Mutex<Vec<bool>>> = Default::default();
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(16);
+        app.agents.write().unwrap().insert(2, crate::agent_ws::Agent::test_stub(tx));
+        let responder = app.clone();
+        let reported_seen = reported.clone();
+        let pushed_seen = pushes.clone();
+        tokio::spawn(async move {
+            while let Some(frame) = rx.recv().await {
+                let v: serde_json::Value = serde_json::from_str(&frame).unwrap();
+                if v["method"] == "relay.apply" {
+                    let desired = v["params"]["desired_running"].as_bool().unwrap();
+                    let empty = v["params"]["config"].as_str().unwrap_or("x").is_empty();
+                    pushed_seen.lock().unwrap().push(desired);
+                    if empty {
+                        // 忠实两分：true=自造占位写盘（指纹变为占位哈希），
+                        // false=停服务删文件（指纹清空）。
+                        *reported_seen.lock().unwrap() =
+                            if desired { "fabricated-placeholder-hash".into() } else { String::new() };
+                    }
+                }
+                if let Some(id) = v["id"].as_str() {
+                    if let Some(slot) = responder.proxy_rpcs.lock().unwrap().remove(id) {
+                        slot.send(Ok(serde_json::json!({}))).ok();
+                    }
+                }
+            }
+        });
+
+        // 推送是 fire-and-forget（try_send 不等应答），每拍后让步给 responder
+        // 消费帧，桩的状态更新才发生在下一拍之前。
+        for _ in 0..3 {
+            let hash = reported.lock().unwrap().clone();
+            on_agent_hash_ext(&app, 2, "", Some(&hash), None).await.unwrap();
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+
+        let pushes = pushes.lock().unwrap();
+        assert_eq!(pushes.len(), 1, "三拍心跳只该推一次（首拍清场），实际 {:?} 次", pushes);
+        assert!(!pushes[0], "空期望的推送必须带 desired_running=false（停服务清理）");
+        assert!(reported.lock().unwrap().is_empty(), "收敛后 agent 指纹应为空（服务已停、文件已清）");
     }
 
     /// 收敛态（上报指纹==期望、realm 应在跑）的心跳必须真正发出 ensure_started
