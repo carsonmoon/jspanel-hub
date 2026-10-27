@@ -328,22 +328,31 @@ impl<S: futures_core::Stream + Unpin> futures_core::Stream for Metered<S> {
 /// is free). Not a fetched checksum: whoever can replace the binary can replace
 /// that too. Deliberately deferred, as it couples agent releases to hub
 /// releases.
+/// `<db 目录>/agent/<arch>/monitor-agent`——fork 的本地覆盖（协议变更 rollout
+/// 用）：该文件存在时 install.sh 装它而不是 Release。装机/升级与版本查询都
+/// 以本函数为路径口径；它会静默盖住 Release，故分发处带 X-Agent-Source 头、
+/// 版本页亮「本地覆盖生效中」（曾盖出 10-01 陈旧构建无人知，2026-10-27）。
+pub fn agent_override_path(app: &App, arch: &str) -> std::path::PathBuf {
+    app.proxy_dir.parent().unwrap_or(std::path::Path::new(".")).join("agent").join(arch).join("monitor-agent")
+}
+
 async fn agent_binary(State(app): State<Shared>, Path(arch): Path<String>) -> Response {
     if !matches!(arch.as_str(), "x86_64" | "aarch64") {
         return api::answer(StatusCode::NOT_FOUND, "unknown architecture");
     }
     // 本地覆盖（fork 用）：构建出的定制 agent 放到 `<db 目录>/agent/<arch>`，
     // install.sh 就会装它而不是上游 release——管控协议的改动由此到达每台 VPS。
-    let local = app
-        .proxy_dir
-        .parent()
-        .unwrap_or(std::path::Path::new("."))
-        .join("agent")
-        .join(arch.clone())
-        .join("monitor-agent");
-    if let Ok(bytes) = tokio::fs::read(&local).await {
-        info!("serving local agent override: {}", local.display());
-        return ([(header::CONTENT_TYPE, "application/octet-stream")], bytes).into_response();
+    if let Ok(bytes) = tokio::fs::read(agent_override_path(&app, &arch)).await {
+        info!("serving local agent override for {arch}");
+        return (
+            [
+                (header::CONTENT_TYPE, "application/octet-stream"),
+                // install.sh 读到即打告警：覆盖是有意机制，但装机输出必须可见。
+                (header::HeaderName::from_static("x-agent-source"), "local-override"),
+            ],
+            bytes,
+        )
+            .into_response();
     }
     let Ok(Ok(permit)) = tokio::time::timeout(RELAY_WAIT, RELAY_GATE.acquire()).await else {
         return api::answer(StatusCode::SERVICE_UNAVAILABLE, "too many downloads in flight, try again");

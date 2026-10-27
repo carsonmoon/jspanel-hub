@@ -1624,10 +1624,28 @@ pub async fn versions(_: Admin, State(app): State<Shared>) -> Json<Value> {
         // github.com is a supported deployment, not a fault to report.
         "hub_latest": latest.hub,
         "agent_latest": latest.agent,
+        // 本地覆盖生效中的架构（fork 机制，见 main::agent_override_path）：
+        // 面板更新页据此亮警示——覆盖静默盖住 Release 曾送出陈旧构建。
+        "agent_override": agent_override(&app).await,
         // Whether the navigation marks an update. It governs the mark alone: the
         // lookup runs either way, so the update page still answers when opened.
         "notice": app.db.get("update_notice").as_deref() != Some("off"),
     }))
+}
+
+/// 覆盖存在的架构列表（空 = 无覆盖，装机走 Release）。两个 stat，不缓存。
+async fn agent_override(app: &App) -> Vec<&'static str> {
+    let mut out = Vec::new();
+    for arch in ["x86_64", "aarch64"] {
+        if tokio::fs::metadata(crate::agent_override_path(app, arch))
+            .await
+            .map(|m| m.is_file())
+            .unwrap_or(false)
+        {
+            out.push(arch);
+        }
+    }
+    out
 }
 
 /// Whether the cached lookup still answers. One that returned nothing is held

@@ -1141,7 +1141,7 @@ function upgradeCommand(site: string) {
   return scriptCommand(site, () => ["--upgrade"])
 }
 
-export type Versions = { hub: string; hub_latest: string; agent_latest: string; notice: boolean }
+export type Versions = { hub: string; hub_latest: string; agent_latest: string; notice: boolean; agent_override?: string[] }
 
 /**
  * What is running and what is published. Read once per panel load: the hub holds
@@ -4106,7 +4106,7 @@ function Update({ versions, reload, nodes, site, refusal }: {
             <VersionPair current={versions.hub} latest={versions.hub_latest} />
             {behind(versions.hub, versions.hub_latest) && (
               <Button size="sm" variant="ghost" asChild>
-                <a href={releaseUrl("monitor", versions.hub_latest)} target="_blank" rel="noreferrer">
+                <a href={releaseUrl("jspanel-hub", versions.hub_latest)} target="_blank" rel="noreferrer">
                   发布说明
                 </a>
               </Button>
@@ -4116,6 +4116,11 @@ function Update({ versions, reload, nodes, site, refusal }: {
       </Card>
 
       <Card className="gap-4 p-5">
+        {!!versions.agent_override?.length && (
+          <p className="rounded-md bg-amber-500/10 px-3 py-2 text-xs text-amber-600 dark:text-amber-400">
+            agent 本地覆盖生效中（{versions.agent_override.join("、")}）：装机与升级将使用面板机上的该文件而非 Release
+          </p>
+        )}
         <div className="flex flex-wrap items-center justify-between gap-2">
           <h3 className="text-sm font-semibold">节点程序</h3>
           <span className="text-xs text-muted-foreground">
@@ -4142,7 +4147,7 @@ function Update({ versions, reload, nodes, site, refusal }: {
                   </Button>
                   {versions.agent_latest && (
                     <Button size="sm" variant="ghost" asChild>
-                      <a href={releaseUrl("agent", versions.agent_latest)} target="_blank" rel="noreferrer">
+                      <a href={releaseUrl("jspanel-agent", versions.agent_latest)} target="_blank" rel="noreferrer">
                         发布说明
                       </a>
                     </Button>

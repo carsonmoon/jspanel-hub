@@ -23,6 +23,8 @@ TOKEN=""
 # 代理协议模块（M3）：默认一并装好 sing-box 核心，--no-singbox 跳过。
 SINGBOX=1
 SB_VERSION=""
+SUB_PORT=""
+SUB_PORT_SET=0
 # 中转核心（M5）：realm 不随装机默认安装——中转机第一次建中转规则时 agent
 # 会自动补装（relay.install）。--with-realm 给网络差、想提前装好的机器。
 REALM=0
@@ -40,7 +42,7 @@ while [ $# -gt 0 ]; do
 	# A flag with no argument: under set -u, `$2` aborts with the shell's own
 	# message rather than the usage below, and `shift 2` cannot proceed.
 	case "$1" in
-	--server | --token | --register | --name | --iface | --interval)
+	--server | --token | --register | --name | --iface | --interval | --sub-port)
 		[ $# -ge 2 ] || { echo "$1 needs a value" >&2; exit 2; } ;;
 	esac
 	case "$1" in
@@ -54,6 +56,7 @@ while [ $# -gt 0 ]; do
 	--name) NAME="$2"; shift 2 ;;
 	--iface) IFACE="$2"; IFACE_SET=1; shift 2 ;;
 	--interval) INTERVAL="$2"; shift 2 ;;
+	--sub-port) SUB_PORT="$2"; SUB_PORT_SET=1; shift 2 ;;
 	--insecure) INSECURE=1; shift ;;
 	--uninstall) UNINSTALL=1; shift ;;
 	--upgrade) UPGRADE=1; shift ;;
@@ -103,8 +106,8 @@ if [ -n "$UPGRADE" ]; then
 fi
 
 [ -n "$SERVER" ] && { [ -n "$TOKEN" ] || [ -n "$REGISTER" ]; } || {
-	echo "usage: install.sh --server URL (--token TOKEN | --register KEY) [--interval SECONDS] [--iface LIST] [--insecure] [--no-singbox] [--singbox-version X] [--with-realm] [--realm-version X]" >&2
-	echo "       install.sh --upgrade [--iface LIST] [--interval SECONDS]" >&2
+	echo "usage: install.sh --server URL (--token TOKEN | --register KEY) [--interval SECONDS] [--iface LIST] [--sub-port PORT] [--insecure] [--no-singbox] [--singbox-version X] [--with-realm] [--realm-version X]" >&2
+	echo "       install.sh --upgrade [--iface LIST] [--interval SECONDS] [--sub-port PORT]" >&2
 	echo "       install.sh --uninstall" >&2
 	echo "--name NAME names the node --register creates; the hostname otherwise" >&2
 	exit 2
@@ -126,6 +129,15 @@ if [ -z "$INTERVAL" ]; then
 fi
 case "$INTERVAL" in "" | *[!0-9]*) echo "interval must be an integer from 1 to 3600" >&2; exit 2 ;; esac
 [ "$INTERVAL" -ge 1 ] && [ "$INTERVAL" -le 3600 ] || { echo "interval must be from 1 to 3600" >&2; exit 2; }
+# --sub-port 是订阅分发入口的监听端口（每台自选，重装不传即沿用上一台的值，
+# 传空清除——语义与 --iface 同款：批量命令不带它，单机配置不因升级丢失）。
+if [ "$SUB_PORT_SET" -eq 0 ]; then
+	SUB_PORT=$(cat "$UNIT_FILE" "$RC_FILE" 2>/dev/null | sed -n \
+		-e 's/^ExecStart=.* --sub-port \([0-9][0-9]*\).*/\1/p' \
+		-e 's/^command_args=".* --sub-port \([0-9][0-9]*\).*/\1/p' | tail -n 1)
+	if [ -n "$SUB_PORT" ]; then echo "keeping --sub-port $SUB_PORT from the previous install"; fi
+fi
+case "$SUB_PORT" in "" | *[!0-9]*) : ;; *) [ "$SUB_PORT" -ge 1 ] && [ "$SUB_PORT" -le 65535 ] || { echo "sub-port must be from 1 to 65535" >&2; exit 2; } ;; esac
 # Which interfaces carry this machine's traffic is known only on the machine,
 # and the batch command a fleet shares cannot carry one value per machine. A
 # rerun without --iface, the documented upgrade, therefore keeps the value in
@@ -251,7 +263,8 @@ esac
 # which is why none is requested here.
 URL="${SERVER%/}/agent/$ARCH"
 TMP="$(mktemp)"
-trap 'rm -f "$TMP"' EXIT
+HDR="$(mktemp)"
+trap 'rm -f "$TMP" "$HDR"' EXIT
 
 echo "downloading monitor-agent ($ARCH)"
 # The hub relays four downloads at once and queues the rest for 30 seconds. A
@@ -260,7 +273,7 @@ echo "downloading monitor-agent ($ARCH)"
 # final and shown with the hub's own reason, which --fail would discard.
 TRIES=0
 while :; do
-	CODE=$(curl -sSL --max-time 300 -w '%{http_code}' "$URL" -o "$TMP") || exit 1
+	CODE=$(curl -sSL --max-time 300 -w '%{http_code}' -D "$HDR" "$URL" -o "$TMP") || exit 1
 	[ "$CODE" = 503 ] && [ "$TRIES" -lt 5 ] || break
 	TRIES=$((TRIES + 1))
 	echo "the hub is busy relaying to other machines; retrying in 5 seconds"
@@ -268,6 +281,13 @@ while :; do
 done
 [ "$CODE" = 200 ] ||
 	{ printf 'download failed (HTTP %s): %s\n' "$CODE" "$(head -n 1 "$TMP" | cut -c1-500)" >&2; exit 1; }
+# The hub answers a local override build (the fork's protocol-rollout mechanism,
+# <db>/agent/<arch>) with X-Agent-Source: local-override instead of the release.
+# An intentional override installs as normal, but never silently: this line is
+# what once surfaced a stale October build that had been served for weeks.
+if grep -qi '^x-agent-source: *local-override' "$HDR" 2>/dev/null; then
+	echo "warning: the hub is serving a LOCAL OVERRIDE agent build, not the release (its update page shows the same)" >&2
+fi
 # A relay can answer 200 with something other than the program, such as a
 # mirror's error page. Checked before the running agent is stopped, so a batch
 # run through such a relay leaves each machine on the agent it had, rather than
@@ -392,7 +412,7 @@ if [ "$INIT" = openrc ]; then
 #!/sbin/openrc-run
 description="monitor agent"
 command="$BIN"
-command_args="--interval $INTERVAL${INSECURE:+ --insecure}"
+command_args="--interval $INTERVAL${INSECURE:+ --insecure}${SUB_PORT:+ --sub-port $SUB_PORT}"
 supervisor="supervise-daemon"
 command_user="monitor-agent"
 respawn_delay=5
@@ -437,7 +457,7 @@ Wants=network-online.target
 [Service]
 Type=simple
 EnvironmentFile=$ENV_FILE
-ExecStart=$BIN --interval $INTERVAL${INSECURE:+ --insecure}
+ExecStart=$BIN --interval $INTERVAL${INSECURE:+ --insecure}${SUB_PORT:+ --sub-port $SUB_PORT}
 Restart=always
 RestartSec=5
 # A fixed user rather than DynamicUser=: when the mount namespace cannot be
