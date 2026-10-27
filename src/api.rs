@@ -6693,8 +6693,17 @@ mod tests {
         std::thread::spawn(move || {
             for stream in listener.incoming().flatten() {
                 let mut s = stream;
-                use std::io::Write;
+                use std::io::{Read, Write};
+                // 先读掉请求再应答，答完关写端并排空对端剩余数据：不读就
+                // close 时 Linux 对未读数据回 RST，会把客户端尚未读走的
+                // 响应一起撕掉（CI 上稳定复现的 flaky，macOS 时序侥幸绿）。
+                let mut buf = [0u8; 4096];
+                let _ = s.read(&mut buf);
                 let _ = s.write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n");
+                let _ = s.shutdown(std::net::Shutdown::Write);
+                while let Ok(n @ 1..) = s.read(&mut buf) {
+                    let _ = n;
+                }
             }
         });
         let mk = |name: &str, port: i64, enabled: bool| crate::db::ProxyNode {
