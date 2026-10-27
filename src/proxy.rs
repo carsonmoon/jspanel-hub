@@ -3937,6 +3937,50 @@ mod tests {
     /// M12：连接事件解码——用服务器实捕的两条真实帧：一条 UPDATE（只带
     /// id 与上行增量），一条 NEW（带完整连接与 user）。CLOSED 与 UPDATE
     /// 同构（无 connection）。
+    /// 架构巡检批次4：两仓（hub/agent）的连接事件解码测试钉同一份 golden
+    /// 字节夹具 src/testdata/singbox-events.golden——NEW 全五元组、真实捕包
+    /// UPDATE、带收尾增量的 CLOSED 各一条。sha 常量是跨仓对齐销：改任一侧
+    /// 夹具必须同步另一侧并同步换两仓的常量，否则测试红。协议知识（字段号、
+    /// wire type、生命周期语义）从此只有一份事实源。
+    #[test]
+    fn golden_fixture_decodes_identically_across_repos() {
+        const GOLDEN_SHA: &str = "94870bb2c541976ad13a9357bf029bbbcb1d1c0c4dbd48a7f82de3a3f7864791";
+        let golden = include_bytes!("testdata/singbox-events.golden");
+        use sha2::{Digest, Sha256};
+        assert_eq!(
+            hex::encode(Sha256::digest(golden)),
+            GOLDEN_SHA,
+            "golden 夹具与两仓共享版本不一致：任何一侧改动都要同步另一侧"
+        );
+
+        let mut rest = &golden[..];
+        let mut events = Vec::new();
+        while !rest.is_empty() {
+            let n = rest[0] as usize;
+            events.push(decode_connection_event(&rest[1..1 + n]).expect("golden 帧必须可解码"));
+            rest = &rest[1 + n..];
+        }
+        assert_eq!(events.len(), 3);
+        match &events[0] {
+            ConnEvent::New { id, user, inbound, network, source, destination, domain } => {
+                assert_eq!(
+                    (id.as_str(), user.as_str(), inbound.as_str(), network.as_str()),
+                    ("conn-1", "alice", "in-11990", "udp")
+                );
+                assert_eq!(
+                    (source.as_str(), destination.as_str(), domain.as_str()),
+                    ("1.2.3.4:5", "example.com:443", "example.com")
+                );
+            }
+            other => panic!("第一帧应为 NEW：{other:?}"),
+        }
+        assert_eq!(
+            events[1],
+            ConnEvent::Update { id: "e0a2d363-617b-47be-9aca-bbcd376e53ad".into(), up: 1570, down: 0 }
+        );
+        assert_eq!(events[2], ConnEvent::Closed { id: "c1".into(), up: 111, down: 222 });
+    }
+
     #[test]
     fn connection_event_decode_reads_deltas_and_user() {
         let update: Vec<u8> = hex_to_bytes(
