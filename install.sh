@@ -482,7 +482,7 @@ if [ "$SINGBOX" = 1 ]; then
 		aarch64) SB_ARCH=arm64 ;;
 	esac
 	SB_VERSION=${SB_VERSION:-$(curl -sSL --max-time 20 "https://api.github.com/repos/SagerNet/sing-box/releases/latest" | sed -n 's/.*"tag_name": *"v\([^"]*\)".*/\1/p' | head -n 1)}
-	if [ -z "$SB_VERSION" ] || [ -n "$(printf %s "$SB_VERSION" | tr -d '0-9.')"; ]; then
+	if [ -z "$SB_VERSION" ] || [ -n "$(printf %s "$SB_VERSION" | tr -d '0-9.')" ]; then
 		echo "warning: could not resolve the latest sing-box version; skipped (it is installed automatically when the first node is created)" >&2
 	else
 		SB_ROOT="/opt/monitor-proxy"
