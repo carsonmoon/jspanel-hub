@@ -41,5 +41,5 @@ sudo sh setup-tls.sh --domain panel.example.com --email ops@example.com
 
 ## AI 接入（MCP）
 
-面板自带 MCP 服务器：Claude Desktop、Cursor 等 AI 客户端经 OAuth 授权后可查询监控数据、按授权执行节点命令，全程审计、随时吊销。见 [docs/mcp.md](docs/mcp.md)。
+面板自带 MCP 服务器：Claude Desktop、Cursor 等 AI 客户端经 OAuth 授权后可查询监控数据、按授权执行节点命令，全程审计、随时吊销。见 [MCP.md](MCP.md)。
 
