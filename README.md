@@ -39,3 +39,7 @@ sudo sh setup-tls.sh --domain panel.example.com --email ops@example.com
 已装好的 hub 也能直接从自身取这份脚本：`curl -fsSL https://<hub>/setup-tls.sh`。
 `--dns dns_cf` 等走 DNS API，支持泛域名与 CDN 场景；`--status` 查看，`--off` 撤下。
 
+## AI 接入（MCP）
+
+面板自带 MCP 服务器：Claude Desktop、Cursor 等 AI 客户端经 OAuth 授权后可查询监控数据、按授权执行节点命令，全程审计、随时吊销。见 [docs/mcp.md](docs/mcp.md)。
+

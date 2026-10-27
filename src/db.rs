@@ -3892,7 +3892,11 @@ impl Db {
     }
 
     #[allow(clippy::type_complexity)] // 五元组返回是操作审计列表的既定形态
-    pub fn mcp_operations(&self, limit: i64) -> Result<Vec<(String, String, String, String, i64)>> {
+    /// 操作审计最近 limit 条（安全页「最近操作」）。列序 tool/node/params/
+    /// at/lease 对应 (String, String, String, i64, String)——元组第 4/5 位
+    /// 曾与列序写反（at INTEGER 按 String 读），collect 整批 Err 被上层
+    /// unwrap_or_default 吞掉，审计面板自上线起恒空（2026-10-27 修）。
+    pub fn mcp_operations(&self, limit: i64) -> Result<Vec<(String, String, String, i64, String)>> {
         let conn = self.conn();
         let mut stmt = conn
             .prepare("SELECT tool, node, params, at, lease FROM mcp_operations ORDER BY id DESC LIMIT ?1")?;

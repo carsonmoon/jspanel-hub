@@ -1049,5 +1049,26 @@ mod tests {
         assert!(lease_hash(&app, &bearer).is_some());
         app.db.set("mcp_enabled", "off").unwrap();
         assert!(lease_hash(&app, &bearer).is_none());
+
+        // 每一次 tools/call 都进操作审计（安全页「最近操作」的数据源）：
+        // 工具成败不影响记账——审计在 outcome 处理之前落库。
+        app.db.set("mcp_enabled", "on").unwrap();
+        let call = endpoint(
+            State(app.clone()),
+            bearer.clone(),
+            Ok(Json(json!({"jsonrpc":"2.0","id":1,"method":"tools/call",
+                           "params":{"name":"get_node","arguments":{"node":"不存在"}}}))),
+        )
+        .await;
+        assert_eq!(call.status(), StatusCode::OK);
+        let cfg = admin_config(Admin, State(app.clone())).await;
+        let cfg: Value = serde_json::from_str(&body(cfg).await).unwrap();
+        assert_eq!(
+            cfg["operations"].as_array().map(Vec::len),
+            Some(1),
+            "tools/call 必须在审计留一行，实际: {}",
+            cfg["operations"]
+        );
+        assert_eq!(cfg["operations"][0]["tool"], "get_node");
     }
 }
