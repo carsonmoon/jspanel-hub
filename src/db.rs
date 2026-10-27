@@ -2695,6 +2695,15 @@ fn row_to_sub_user(r: &rusqlite::Row) -> rusqlite::Result<SubUser> {
     })
 }
 
+#[derive(Debug, Clone)]
+pub struct McpOperation {
+    pub tool: String,
+    pub node: String,
+    pub params: String,
+    pub at: i64,
+    pub lease: String,
+}
+
 impl Db {
     pub fn open(path: &str) -> Result<Self> {
         let conn = Connection::open(path)?;
@@ -3892,16 +3901,23 @@ impl Db {
     }
 
     #[allow(clippy::type_complexity)] // 五元组返回是操作审计列表的既定形态
-    /// 操作审计最近 limit 条（安全页「最近操作」）。列序 tool/node/params/
-    /// at/lease 对应 (String, String, String, i64, String)——元组第 4/5 位
-    /// 曾与列序写反（at INTEGER 按 String 读），collect 整批 Err 被上层
-    /// unwrap_or_default 吞掉，审计面板自上线起恒空（2026-10-27 修）。
-    pub fn mcp_operations(&self, limit: i64) -> Result<Vec<(String, String, String, i64, String)>> {
+    /// 操作审计最近 limit 条（安全页「最近操作」）。命名字段结构体：列序
+    /// 错配在解构处即编译错误——曾用裸五元组且第 4/5 位与 SELECT 列序写反
+    /// （at INTEGER 按 String 读），collect 整批 Err 被上层吞掉，审计面板
+    /// 自上线起恒空（2026-10-27 修，架构巡检批次2 立此为同类接口的先例）。
+    pub fn mcp_operations(&self, limit: i64) -> Result<Vec<McpOperation>> {
         let conn = self.conn();
         let mut stmt = conn
             .prepare("SELECT tool, node, params, at, lease FROM mcp_operations ORDER BY id DESC LIMIT ?1")?;
-        let rows =
-            stmt.query_map([limit], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)))?;
+        let rows = stmt.query_map([limit], |r| {
+            Ok(McpOperation {
+                tool: r.get(0)?,
+                node: r.get(1)?,
+                params: r.get(2)?,
+                at: r.get(3)?,
+                lease: r.get(4)?,
+            })
+        })?;
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
 
@@ -4915,7 +4931,8 @@ impl Db {
                                  ipv4_pin=COALESCE(?15,ipv4_pin), ipv6_pin=COALESCE(?16,ipv6_pin),
                                  group_name=COALESCE(?17,group_name),
                                  dns_name=COALESCE(?18,dns_name),
-                                 purchase_url=COALESCE(?19,purchase_url)
+                                 purchase_url=COALESCE(?19,purchase_url),
+                                 remark=COALESCE(?20,remark)
                  WHERE id=?1",
             )?;
             for id in ids {
@@ -4938,7 +4955,8 @@ impl Db {
                     n.ipv6_pin,
                     n.group,
                     n.dns_name,
-                    n.purchase_url
+                    n.purchase_url,
+                    n.remark
                 ])?;
                 // Dropping the transaction uncommitted rolls back the nodes
                 // already updated.
@@ -6175,6 +6193,66 @@ mod tests {
 
     fn db() -> Db {
         Db::open(":memory:").unwrap()
+    }
+
+    /// 主机字段管线守卫（架构巡检批次2）：NodePatch 的每个字段都必须真的
+    /// 落进 UPDATE——曾漏 remark 列（PUT 200 OK 静默丢弃）。逐字段 patch→
+    /// 落库读回；再断言单字段 patch 不动其他列（COALESCE 语义=部分更新安全）。
+    /// 新增 Node 字段时把断言加进 fields 清单即可，漏 UPDATE 此测试必红。
+    #[test]
+    fn every_node_patch_field_lands_in_the_update() {
+        let db = db();
+        let id = db.create_node(&Node { name: "roundtrip".into(), ..Default::default() }, "tok").unwrap();
+
+        let patch = NodePatch {
+            name: Some("改名".into()),
+            sort: Some(7),
+            public: Some(false),
+            price: Some(9.5),
+            currency: Some("CNY".into()),
+            billing_cycle: Some("yearly".into()),
+            expires_at: Some(Some("2027-12-31".into())),
+            remark: Some("备注在".into()),
+            traffic_limit: Some(123_456_789),
+            traffic_mode: Some("max".into()),
+            traffic_reset_day: Some(15),
+            notify: Some(true),
+            country_pin: Some("JP".into()),
+            ipv4_pin: Some("203.0.113.10".into()),
+            ipv6_pin: Some("2001:db8::10".into()),
+            group: Some("g1".into()),
+            dns_name: Some("n1.example.com".into()),
+            purchase_url: Some("https://buy.example.com".into()),
+        };
+        assert!(db.update_nodes(&[id], &patch).unwrap());
+
+        let n = db.node(id).unwrap().unwrap();
+        assert_eq!(n.name, "改名");
+        assert_eq!(n.sort, 7);
+        assert!(!n.public);
+        assert!((n.price - 9.5).abs() < 1e-9);
+        assert_eq!(n.currency, "CNY");
+        assert_eq!(n.billing_cycle, "yearly");
+        assert_eq!(n.expires_at.as_deref(), Some("2027-12-31"));
+        assert_eq!(n.remark, "备注在");
+        assert_eq!(n.traffic_limit, 123_456_789);
+        assert_eq!(n.traffic_mode, "max");
+        assert_eq!(n.traffic_reset_day, 15);
+        assert!(n.notify);
+        assert_eq!(n.country_pin, "JP");
+        assert_eq!(n.ipv4_pin, "203.0.113.10");
+        assert_eq!(n.ipv6_pin, "2001:db8::10");
+        assert_eq!(n.group, "g1");
+        assert_eq!(n.dns_name, "n1.example.com");
+        assert_eq!(n.purchase_url, "https://buy.example.com");
+
+        // 部分更新语义：只动 sort，其余列（含曾静默丢失的 remark）原样保留。
+        let touch = NodePatch { sort: Some(99), ..Default::default() };
+        assert!(db.update_nodes(&[id], &touch).unwrap());
+        let n = db.node(id).unwrap().unwrap();
+        assert_eq!(n.sort, 99);
+        assert_eq!(n.remark, "备注在", "单字段 patch 不得清掉其他列");
+        assert_eq!(n.name, "改名", "单字段 patch 不得清掉其他列");
     }
 
     /// 2026-10-26/27 三次 hub 整体冻结的根因回归：take_mcp_code 曾在首个

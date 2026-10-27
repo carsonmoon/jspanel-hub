@@ -827,8 +827,8 @@ pub async fn admin_config(_: Admin, State(app): State<Shared>) -> Response {
         .mcp_operations(30)
         .unwrap_or_default()
         .into_iter()
-        .map(|(tool, node, params, at, lease)| {
-            json!({ "tool": tool, "node": node, "params": params, "at": at, "lease": lease })
+        .map(|op| {
+            json!({ "tool": op.tool, "node": op.node, "params": op.params, "at": op.at, "lease": op.lease })
         })
         .collect();
     Json(json!({
