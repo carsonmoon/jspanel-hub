@@ -1,0 +1,67 @@
+[package]
+name = "monitor-hub"
+version = "1.4.0"
+edition = "2021"
+license = "MIT"
+description = "Lightweight server monitoring hub"
+repository = "https://github.com/monitor-probe/monitor"
+
+[dependencies]
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "signal", "sync", "fs", "process", "io-util"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+axum = { version = "0.8", features = ["ws", "macros"] }
+rusqlite = { version = "0.37", features = ["bundled", "backup"] }
+# socks：本机协议的出口链探测（经 socks5 出口访问探测目标，全链真实延迟）。
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream", "socks"] }
+# 邮件 SMTP 渠道（二期通知底座）：rustls 栈与 reqwest 一致，musl 交叉编译无负担
+lettre = { version = "0.11", default-features = false, features = ["smtp-transport", "builder", "rustls-tls", "tokio1", "tokio1-rustls"] }
+argon2 = "0.5"
+rand = "0.9"
+sha2 = "0.10"
+hex = "0.4"
+futures-core = "0.3"
+futures-util = { version = "0.3", default-features = false, features = ["alloc"] }
+chrono = { version = "0.4", default-features = false, features = ["std", "clock", "serde"] }
+rust-embed = { version = "8", features = ["include-exclude"] }
+mime_guess = "2"
+tokio-util = { version = "0.7", features = ["io"] }
+tower-http = { version = "0.6", features = ["limit", "compression-gzip"] }
+# Theme archives. Both are pure Rust: the release binary is built with `cross`
+# and the image is FROM scratch, which rules out a C dependency or an external
+# tar.
+tar = { version = "0.4", default-features = false }
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
+base64 = "0.22"
+serde_yaml = "0.9"
+x25519-dalek = { version = "2", features = ["static_secrets"] }
+rcgen = "0.14.10"
+# 用户级流量统计（M7）轮询 sing-box 的 v2ray stats：只有一个 gRPC 方法，
+# 直接驱动 h2 比引入整套 tonic 便宜得多。
+h2 = "0.4"
+http = "1"
+
+[dev-dependencies]
+serde_urlencoded = "0.7"
+# Only the tests need a movable clock; the relay deadline spans minutes.
+# dev-dependencies do not reach the shipped binary.
+tokio = { version = "1", features = ["test-util"] }
+
+[lints.clippy]
+# 锁不可跨 await：冻结排查时全库审查过一轮（2026-10-27，零违例），此后由
+# clippy 机械拦截（含 CI 的 -D warnings 路径），不再依赖人记。
+await_holding_lock = "deny"
+
+[profile.release]
+codegen-units = 1
+lto = true
+opt-level = "z"
+panic = "abort"
+# 冻结取证：保留行表，冻结现场的 gdb 栈才有函数名与行号（2026-10-27 两次
+# 冻结因 strip=true 无从定位）。完整 DWARF 会在 musl+LTO 链接期爆内存，行表
+# 是取证够用的轻量档。体积略涨属预期，不影响运行性能。
+debug = "line-tables-only"
+strip = "none"
