@@ -304,6 +304,9 @@ fn node_view(node: &Node, current: Option<&Agent>, traffic: &Traffic, full: bool
         view["country_auto"] = json!(node.country);
         view["token"] = json!(node.token);
         view["notify"] = json!(node.notify);
+        // 备注：仅管理员视图。e2e 契约要求 remark 往返（建站时带入、面板读
+        // 回）；公开视图按上面的白名单永不携带。
+        view["remark"] = json!(node.remark);
         // 购买网站：主机名点击跳转的目标。DDNS 绑定一并回显——保存路径早于
         // 本视图，这两列此前从未到达面板，编辑弹窗一直显示为空。
         view["purchase_url"] = json!(node.purchase_url);
