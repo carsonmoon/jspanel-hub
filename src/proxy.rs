@@ -3527,13 +3527,15 @@ pub async fn on_agent_hash_ext(
             // relay_hash 只对盘上指纹、看不到运行态，所以收敛后也每拍 poke
             // 一次，由 agent 侧 is-active 幂等兜着。
             if server_id != 0 {
-                // 只让 agent 确保拉起，不碰配置文件（旧的 __noop__ 体会被当
-                // 配置写盘，损坏 realm.toml）。
+                // 独立方法（批次1b）：只拉起不碰配置。曾借道 relay.apply 靠
+                // __noop__+空sha+ensure_started 三个魔法字段区分——一个 RPC
+                // 两个操作，调用者要背检查顺序（__noop__ 字面量曾被旧版当
+                // 配置写盘损坏 realm.toml）。
                 if let Err(e) = crate::agent_ws::call_agent(
                     app,
                     server_id,
-                    "relay.apply",
-                    serde_json::json!({"config":"__noop__","sha256":"","ensure_started":true}),
+                    "relay.ensure_started",
+                    serde_json::json!({}),
                     Duration::from_secs(1),
                 )
                 .await
@@ -4349,7 +4351,7 @@ mod relay_render_tests {
         tokio::spawn(async move {
             while let Some(frame) = rx.recv().await {
                 let v: serde_json::Value = serde_json::from_str(&frame).unwrap();
-                if v["method"] == "relay.apply" && v["params"]["ensure_started"].as_bool() == Some(true) {
+                if v["method"] == "relay.ensure_started" {
                     seen.lock().unwrap().push(v["params"].clone());
                 }
                 if let Some(id) = v["id"].as_str() {
@@ -4368,8 +4370,7 @@ mod relay_render_tests {
         // poke 走 call_agent 等应答，函数返回时帧必已被桩消费并记账。
         let got = pokes.lock().unwrap();
         assert_eq!(got.len(), 1, "恰好一次拉活 poke：{got:?}");
-        assert_eq!(got[0]["config"], "__noop__", "poke 不携带配置体：{got:?}");
-        assert_eq!(got[0]["sha256"], "", "poke 不带指纹：{got:?}");
+        assert!(got[0].as_object().map(|m| m.is_empty()).unwrap_or(false), "poke 无参数：{got:?}");
     }
 
     #[test]
