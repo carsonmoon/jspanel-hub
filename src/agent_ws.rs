@@ -527,6 +527,17 @@ fn dispatch(
             let source =
                 country_source(ip, field("ipv4"), field("ipv6")).map_or_else(String::new, |a| a.to_string());
             let owed = app.db.save_facts(node_id, &rpc.params, ip, &source)?;
+            // 订阅分发端口走结构化 hello（批次3）：握手的 x-sub-port 头退为
+            // 老 agent 的初值，hello 到达即以结构化值为准。重连双方值恒同源
+            // （同一 agent 配置），迟到旧 hello 的覆盖窗口无实际危害。
+            if let Some(p) = rpc.params.get("sub_port").and_then(serde_json::Value::as_u64) {
+                if let (Ok(p16), Some(agent)) = (
+                    u16::try_from(p),
+                    app.agents.write().unwrap_or_else(|e| e.into_inner()).get_mut(&node_id),
+                ) {
+                    agent.sub_port = p16;
+                }
+            }
             return Ok(owed.then_some(source));
         }
         // Dropped quietly: two reports the network bunched are how an honest
@@ -995,9 +1006,13 @@ mod tests {
     /// A connected agent, the precondition for filing any report: the session
     /// holds the node's live state.
     fn connect(app: &App) -> (i64, mpsc::Receiver<String>) {
+        connect_with_sub_port(app, 0)
+    }
+
+    fn connect_with_sub_port(app: &App, sub_port: u16) -> (i64, mpsc::Receiver<String>) {
         let id = node(app);
         let (tx, rx) = mpsc::channel(4);
-        app.agents.write().unwrap().insert(id, Agent::new(1, tx, 0));
+        app.agents.write().unwrap().insert(id, Agent::new(1, tx, sub_port));
         (id, rx)
     }
 
@@ -1426,6 +1441,26 @@ mod tests {
         assert_eq!(session.results.len(), RESULTS_PER_WINDOW as usize, "the excess of one window is dropped");
         send(&app, id, &mut session, 25, &result_json(task, 1)).unwrap();
         assert_eq!(session.results.len(), RESULTS_PER_WINDOW as usize + 1, "the next window admits again");
+    }
+
+    /// 订阅分发端口走结构化 hello（批次3）：hello params 的 sub_port 覆盖
+    /// 握手头的初值；无此字段（老 agent）保持头值不动。
+    #[test]
+    fn hello_params_override_the_handshake_header_sub_port() {
+        let app = app();
+        let (id, _held) = connect_with_sub_port(&app, 11111);
+        let mut session = Session::default();
+        let hello = json!({"jsonrpc": "2.0", "method": "hello",
+                           "params": {"hostname": "n", "ipv4": "203.0.113.5", "sub_port": 18787}});
+        dispatch(&app, id, "203.0.113.5", &hello.to_string(), &mut session, at_ms(0)).unwrap();
+        assert_eq!(app.agents.read().unwrap()[&id].sub_port, 18787, "hello 结构化值覆盖头初值");
+
+        // 老 agent：hello 不带 sub_port，头初值保持。
+        let (id2, _held2) = connect_with_sub_port(&app, 22222);
+        let hello2 = json!({"jsonrpc": "2.0", "method": "hello",
+                            "params": {"hostname": "old", "ipv4": "203.0.113.6"}});
+        dispatch(&app, id2, "203.0.113.6", &hello2.to_string(), &mut Session::default(), at_ms(0)).unwrap();
+        assert_eq!(app.agents.read().unwrap()[&id2].sub_port, 22222, "老 agent 保持头值");
     }
 
     #[test]
