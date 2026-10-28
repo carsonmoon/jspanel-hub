@@ -2623,6 +2623,31 @@ function SettingsTab({ onSaved }: { onSaved: () => void }) {
             />
           </Field>
           <Field
+            label="CDN 共享证书"
+            hint={
+              s.cdn_cert_set
+                ? "已设置，全部 CDN 中转节点创建时自动使用（去 Cloudflare 仪表盘 SSL/TLS → 源服务器建一张 *.域名 的证书粘贴到下面，15 年有效）"
+                : "未设置。在 Cloudflare 仪表盘 SSL/TLS → 源服务器建一张 *.域名 的证书粘贴到下面，所有 CDN 中转节点创建时自动使用，一次配置不再逐节点粘贴"
+            }
+          >
+            <textarea
+              value={String(s.cdn_cert_pem ?? "")}
+              onChange={(e) => set("cdn_cert_pem", e.target.value)}
+              placeholder={s.cdn_cert_set ? "证书 PEM（已设置，留空不变）" : "证书 PEM（-----BEGIN CERTIFICATE----- 开头）"}
+              rows={3}
+              spellCheck={false}
+              className={TEXTAREA}
+            />
+            <textarea
+              value={String(s.cdn_key_pem ?? "")}
+              onChange={(e) => set("cdn_key_pem", e.target.value)}
+              placeholder={s.cdn_cert_set ? "私钥 PEM（已设置，留空不变）" : "私钥 PEM（-----BEGIN PRIVATE KEY----- 开头）"}
+              rows={2}
+              spellCheck={false}
+              className={`${TEXTAREA} mt-2`}
+            />
+          </Field>
+          <Field
             label="Cloudflare API Token"
             hint={s.cf_api_token_set ? "已设置，留空不变。主机编辑里的「绑定域名」靠它更新 A 记录" : "未设置。主机编辑里的「绑定域名」靠它更新 A 记录"}
           >
@@ -2666,6 +2691,9 @@ function SettingsTab({ onSaved }: { onSaved: () => void }) {
                 realm_default_version: String(s.realm_default_version ?? ""),
                 // Cloudflare Token 是掩码写：留空 = 保持不变，填了才提交。
                 ...(typeof s.cf_api_token === "string" && s.cf_api_token ? { cf_api_token: s.cf_api_token } : {}),
+                // CDN 共享证书同款掩码写：两段各自留空不变，填了才提交。
+                ...(typeof s.cdn_cert_pem === "string" && s.cdn_cert_pem ? { cdn_cert_pem: s.cdn_cert_pem } : {}),
+                ...(typeof s.cdn_key_pem === "string" && s.cdn_key_pem ? { cdn_key_pem: s.cdn_key_pem } : {}),
               }).then((ok) => ok && onSaved())
             }
           >

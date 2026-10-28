@@ -287,6 +287,15 @@ async fn cdn_base_domain(app: &App) -> Result<String> {
     })
 }
 
+/// 设置里的 CDN 共享证书（vless-ws）：一张通配符证书管全部节点，两段
+/// 都有值才算配置好。频繁增删节点的日常里，证书粘贴这个动作只发生在
+/// 设置页这一次。
+fn shared_cdn_cert(app: &App) -> Option<(String, String)> {
+    let cert = app.db.get("cdn_cert_pem").map(|v| v.trim().to_owned()).filter(|v| !v.is_empty())?;
+    let key = app.db.get("cdn_key_pem").map(|v| v.trim().to_owned()).filter(|v| !v.is_empty())?;
+    Some((cert, key))
+}
+
 /// 下一个可用的 c{n}.{基础域}：编号取已用最大值 +1，并跳过任何同名记录
 /// （含 n1/p1 等人工绑定的域名）。
 async fn next_cdn_domain(app: &App) -> Result<String> {
@@ -512,8 +521,13 @@ pub async fn create_node(app: &Shared, mut node: ProxyNode) -> Result<i64> {
             node.cert_pem.as_deref().map(str::trim).filter(|v| !v.is_empty()),
             node.key_pem.as_deref().map(str::trim).filter(|v| !v.is_empty()),
         ) {
+            // 优先级：本次请求手动粘贴 > 设置里的共享证书 > Origin CA
+            // 自动签发（不可用时其报错自带两条出路指引）。
             (Some(c), Some(k)) => (c.to_owned(), k.to_owned()),
-            _ => crate::dns::issue_origin_ca(app, &node.dns_name).await?,
+            _ => match shared_cdn_cert(app) {
+                Some(pair) => pair,
+                None => crate::dns::issue_origin_ca(app, &node.dns_name).await?,
+            },
         };
         Some((ip, cert))
     } else {
@@ -5318,6 +5332,81 @@ mod relay_render_tests {
             );
             assert_eq!(shared.db.proxy_node(nid).unwrap().unwrap().dns_ip, "203.0.113.5");
             crate::dns::set_upsert_stub(None);
+        }
+
+        /// 证书取用优先级：请求手动粘贴 > 设置里的共享证书 > Origin CA
+        /// 自动签发。共享证书存在时签发桩绝不能被碰（否则共享证书形同
+        /// 虚设，每节点一张的旧问题以更隐蔽的方式回归）。
+        #[tokio::test]
+        async fn cdn_cert_priority_pasted_then_shared_then_issued() {
+            let _g = STUB_GUARD.lock().await;
+            let (stub, _calls) = stub_upsert();
+            crate::dns::set_upsert_stub(Some(stub));
+            crate::dns::set_origin_ca_stub(Some(std::sync::Arc::new(|_fqdn| {
+                Ok(("STUB-ISSUED-CERT".to_owned(), "STUB-ISSUED-KEY".to_owned()))
+            })));
+            let shared = app_pair();
+            shared.db.set("cf_api_token", "tok").unwrap();
+            shared.db.set("cdn_base_domain", "cc.baoco.de").unwrap();
+            let machine = mk_machine(&shared, "源机", "203.0.113.5");
+
+            let node_secret = |id: i64| {
+                shared.db.proxy_node_bundles().unwrap().into_iter().find(|b| b.node.id == id).unwrap().secret
+            };
+
+            // ① 无共享证书 → 走自动签发（既有路径不回归）。
+            let a = create_node(
+                &shared,
+                ProxyNode {
+                    name: "A".into(),
+                    protocol: "vless-ws".into(),
+                    server_id: machine,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+            assert_eq!(node_secret(a).cert_pem, "STUB-ISSUED-CERT");
+
+            // ② 配置共享证书后留空创建 → 用共享证书，签发桩不被碰。
+            shared.db.set("cdn_cert_pem", "SHARED-CERT\n").unwrap();
+            shared.db.set("cdn_key_pem", " SHARED-KEY ").unwrap();
+            let b = create_node(
+                &shared,
+                ProxyNode {
+                    name: "B".into(),
+                    protocol: "vless-ws".into(),
+                    server_id: machine,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+            let sb = node_secret(b);
+            assert_eq!(sb.cert_pem, "SHARED-CERT", "留空创建应用共享证书（去首尾空白）");
+            assert_eq!(sb.key_pem, "SHARED-KEY");
+            assert_eq!(sb.tls_mode, "origin-ca");
+
+            // ③ 请求里手动粘贴 > 共享证书。
+            let c = create_node(
+                &shared,
+                ProxyNode {
+                    name: "C".into(),
+                    protocol: "vless-ws".into(),
+                    server_id: machine,
+                    cert_pem: Some("PASTED-CERT".into()),
+                    key_pem: Some("PASTED-KEY".into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+            let sc = node_secret(c);
+            assert_eq!(sc.cert_pem, "PASTED-CERT");
+            assert_eq!(sc.key_pem, "PASTED-KEY");
+
+            crate::dns::set_upsert_stub(None);
+            crate::dns::set_origin_ca_stub(None);
         }
 
         #[tokio::test]

@@ -487,8 +487,8 @@ function NodeDialog({ open, initial, servers, onOpenChange, reload }: {
               <div className="flex flex-col gap-1.5">
                 <Label>证书（可选）</Label>
                 <p className="text-xs text-muted-foreground">
-                  留空自动签发 Cloudflare Origin CA（15 年，需要 Token 有相应权限）；
-                  自动签发不可用时可从 Cloudflare 仪表盘（SSL/TLS → Origin Server）创建后在此粘贴。
+                  留空优先用设置页的「CDN 共享证书」；未配置共享证书时自动签发 Cloudflare Origin CA
+                  （15 年，需要 Token 有相应权限）；都不可用时可在此粘贴（仪表盘 SSL/TLS → Origin Server 创建）。
                 </p>
                 <textarea
                   value={certPem}

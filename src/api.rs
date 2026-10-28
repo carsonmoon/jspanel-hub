@@ -1987,6 +1987,10 @@ pub async fn settings(_: Admin, State(app): State<Shared>) -> Json<Value> {
     );
     // Cloudflare API Token（DDNS 一期）：同款掩码，值本体只写不读。
     out.insert("cf_api_token_set".into(), json!(app.db.get("cf_api_token").is_some_and(|v| !v.is_empty())));
+    // CDN 共享证书（vless-ws）：两段都有值才算配置好；PEM 本体只写不读，
+    // 同 cf_api_token 的掩码模式。
+    let cdn_cert_set = |k: &str| app.db.get(k).is_some_and(|v| !v.trim().is_empty());
+    out.insert("cdn_cert_set".into(), json!(cdn_cert_set("cdn_cert_pem") && cdn_cert_set("cdn_key_pem")));
     // Read-only here. A window is opened and closed through its own route, so the
     // key is always one the hub generated, and `save_settings` continues to refuse
     // both names.
@@ -2059,6 +2063,16 @@ fn setting_error(app: &App, key: &str, value: &Value) -> Option<String> {
         }
         "admin_password" if value.len() < 12 => Some("密码至少 12 位".into()),
         "admin_password" => None,
+        // CDN 共享证书（vless-ws）：空串合法（清除）；非空必须是看起来像
+        // PEM 的文本——写歪了只会在创建节点、sing-box 起不来那一步才暴露。
+        "cdn_cert_pem" if !(value.is_empty() || value.contains("BEGIN CERTIFICATE")) => {
+            Some("CDN 共享证书应为 PEM 文本（-----BEGIN CERTIFICATE----- 开头），留空清除".into())
+        }
+        "cdn_key_pem" if !(value.is_empty() || value.contains("PRIVATE KEY")) => {
+            Some("CDN 共享私钥应为 PEM 文本（-----BEGIN PRIVATE KEY----- 开头），留空清除".into())
+        }
+        // 合法值（含清除）走到这里才算放行——上面的守卫臂只拦写歪的。
+        "cdn_cert_pem" | "cdn_key_pem" => None,
         k if k.starts_with("notify_") => crate::notify::setting_error(k, value),
         k if READABLE_SETTINGS.contains(&k) || k == "github_client_secret" || k == "cf_api_token" => None,
         _ => Some(format!("没有这个设置项：{key}")),
