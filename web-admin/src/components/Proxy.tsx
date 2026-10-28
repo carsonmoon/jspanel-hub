@@ -61,6 +61,10 @@ export type ProxyNode = {
   dns_name: string
   dns_server_id: number
   dns_ip: string
+  /** vless-ws（CDN 中转）的 WebSocket 路径；其余协议为空。 */
+  ws_path: string
+  /** vless-ws 证书是否就绪（Origin CA 签发或已粘贴）。 */
+  cert_ready?: boolean
   users: ProxyUser[]
 }
 
@@ -95,6 +99,7 @@ export type SubUser = {
 
 export const PROTOCOL_LABEL: Record<string, string> = {
   "vless-reality": "VLESS + Reality",
+  "vless-ws": "VLESS + WS（CDN 中转）",
   hysteria2: "Hysteria 2",
   shadowsocks: "Shadowsocks",
   anytls: "AnyTLS",
@@ -220,6 +225,9 @@ function NodeDialog({ open, initial, servers, onOpenChange, reload }: {
   const [egressPaste, setEgressPaste] = useState("")
   const [egressParsed, setEgressParsed] = useState(false)
   const [dnsName, setDnsName] = useState("")
+  const [wsPath, setWsPath] = useState("")
+  const [certPem, setCertPem] = useState("")
+  const [keyPem, setKeyPem] = useState("")
   const [busy, setBusy] = useState(false)
   useEffect(() => {
     if (!open) return
@@ -249,6 +257,9 @@ function NodeDialog({ open, initial, servers, onOpenChange, reload }: {
     setEgressPaste("")
     setEgressParsed(false)
     setDnsName(n?.dns_name ?? "")
+    setWsPath(n?.ws_path ?? "")
+    setCertPem("")
+    setKeyPem("")
   }, [open, initial])
 
   const changeProtocol = (value: string) => {
@@ -274,6 +285,14 @@ function NodeDialog({ open, initial, servers, onOpenChange, reload }: {
         dns_name: dnsName.trim(),
       }
       if (NEEDS_SNI.has(protocol)) body.sni = sni.trim()
+      if (protocol === "vless-ws") {
+        body.ws_path = wsPath.trim()
+        if (uuid.trim()) body.uuid = uuid.trim()
+        if (certPem.trim() && keyPem.trim()) {
+          body.cert_pem = certPem.trim()
+          body.key_pem = keyPem.trim()
+        }
+      }
       if (protocol === "vless-reality") {
         body.flow = flow === "none" ? "" : flow
         if (uuid.trim()) body.uuid = uuid.trim()
@@ -309,6 +328,27 @@ function NodeDialog({ open, initial, servers, onOpenChange, reload }: {
         setPrivateKey(result.private_key ?? "")
         setPublicKey(result.public_key ?? "")
       }
+    } catch (e) {
+      toast.error((e as Error).message)
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  /** vless-ws 证书粘贴/轮换（Origin CA 自动签发不可用时的手动通道）。 */
+  const saveCert = async () => {
+    if (!initial) return
+    setBusy(true)
+    try {
+      await api(`/proxy/nodes/${initial.id}/cdn-cert`, {
+        method: "POST",
+        body: JSON.stringify({ cert_pem: certPem.trim(), key_pem: keyPem.trim() }),
+      })
+      toast.success("证书已保存，配置随即收敛")
+      setCertPem("")
+      setKeyPem("")
+      onOpenChange(false)
+      await reload()
     } catch (e) {
       toast.error((e as Error).message)
     } finally {
@@ -428,6 +468,62 @@ function NodeDialog({ open, initial, servers, onOpenChange, reload }: {
               </details>
             </>
           )}
+          {protocol === "vless-ws" && (
+            <>
+              <div className="rounded-md border border-primary/30 bg-primary/5 p-3 text-xs text-muted-foreground">
+                CDN 中转：客户端经 Cloudflare 小黄云回源（vless+ws+TLS），服务器 IP
+                被墙封锁、直连不通时客户换用本代理的链接即可恢复；平时可与直连代理并存。
+                需要 Cloudflare API Token（设置页「域名解析」）。
+              </div>
+              <div className="flex flex-col gap-1.5">
+                <Label>UUID</Label>
+                <div className="flex gap-2">
+                  <Input value={uuid} onChange={(e) => setUuid(e.target.value)} placeholder="留空自动生成；可粘贴直连代理的 UUID 复用" />
+                  <Button type="button" variant="outline" size="icon" title="随机生成 UUID" disabled={busy} onClick={() => randomize("uuid")}>
+                    <RefreshCw className="size-4" />
+                  </Button>
+                </div>
+              </div>
+              {editing && (
+                <div className="rounded-md border p-3">
+                  <div className="mb-2 flex items-center gap-2 text-sm font-medium">
+                    证书
+                    <span
+                      className={
+                        initial?.cert_ready
+                          ? "rounded bg-up/15 px-1.5 py-0.5 text-[10px] font-medium text-up"
+                          : "rounded bg-destructive/15 px-1.5 py-0.5 text-[10px] font-medium text-destructive"
+                      }
+                    >
+                      {initial?.cert_ready ? "已就绪" : "未就绪"}
+                    </span>
+                  </div>
+                  <p className="mb-2 text-xs text-muted-foreground">
+                    创建时自动签发 Cloudflare Origin CA（15 年）。自动签发不可用或需轮换时在此粘贴。
+                  </p>
+                  <div className="flex flex-col gap-2">
+                    <textarea
+                      value={certPem}
+                      onChange={(e) => setCertPem(e.target.value)}
+                      placeholder="证书 PEM（-----BEGIN CERTIFICATE----- 开头）"
+                      rows={3}
+                      className="w-full rounded-md border border-input bg-transparent px-3 py-2 font-mono text-xs shadow-xs outline-none placeholder:text-muted-foreground focus-visible:border-ring focus-visible:ring-[3px] focus-visible:ring-ring/50 dark:bg-input/30"
+                    />
+                    <textarea
+                      value={keyPem}
+                      onChange={(e) => setKeyPem(e.target.value)}
+                      placeholder="私钥 PEM（-----BEGIN PRIVATE KEY----- 开头）"
+                      rows={2}
+                      className="w-full rounded-md border border-input bg-transparent px-3 py-2 font-mono text-xs shadow-xs outline-none placeholder:text-muted-foreground focus-visible:border-ring focus-visible:ring-[3px] focus-visible:ring-ring/50 dark:bg-input/30"
+                    />
+                    <Button type="button" size="sm" variant="outline" disabled={busy || !certPem.trim() || !keyPem.trim()} onClick={saveCert}>
+                      保存证书
+                    </Button>
+                  </div>
+                </div>
+              )}
+            </>
+          )}
           {protocol === "shadowsocks" && (
             <div className="flex flex-col gap-1.5">
               <Label>加密方法</Label>
@@ -446,14 +542,34 @@ function NodeDialog({ open, initial, servers, onOpenChange, reload }: {
             </div>
           )}
           <div className="flex flex-col gap-1.5">
-            <Label>端口{!editing && "（留空从端口池自动分配）"}</Label>
-            <Input value={port} onChange={(e) => setPort(e.target.value)} placeholder="20000-50000" inputMode="numeric" />
+            <Label>
+              端口
+              {protocol === "vless-ws"
+                ? "（留空自动分配，只支持 8443 / 2053 / 2083 / 2087 / 2096）"
+                : !editing && "（留空从端口池自动分配）"}
+            </Label>
+            <Input
+              value={port}
+              onChange={(e) => setPort(e.target.value)}
+              placeholder={protocol === "vless-ws" ? "8443" : "20000-50000"}
+              inputMode="numeric"
+            />
           </div>
+          {protocol === "vless-ws" && (
+            <div className="flex flex-col gap-1.5">
+              <Label>WebSocket 路径</Label>
+              <Input value={wsPath} onChange={(e) => setWsPath(e.target.value)} placeholder="留空自动随机生成" />
+            </div>
+          )}
           <div className="flex flex-col gap-1.5">
-            <Label>绑定域名（可选，需托管在 Cloudflare）</Label>
-            <Input value={dnsName} onChange={(e) => setDnsName(e.target.value)} placeholder="例如 node1.example.com" />
+            <Label>
+              {protocol === "vless-ws" ? "CDN 域名（留空自动分配 c{n}，需托管在 Cloudflare）" : "绑定域名（可选，需托管在 Cloudflare）"}
+            </Label>
+            <Input value={dnsName} onChange={(e) => setDnsName(e.target.value)} placeholder="例如 c1.example.com" />
             <p className="text-xs text-muted-foreground">
-              绑定后分享链接与二维码改用该域名：IP 被墙时「切换主机」换 IP 不换链接，客户无需重新导入。
+              {protocol === "vless-ws"
+                ? "小黄云（proxied）记录由面板自动创建并维护：切换主机时同步翻转，客户链接永不换。"
+                : "绑定后分享链接与二维码改用该域名：IP 被墙时「切换主机」换 IP 不换链接，客户无需重新导入。"}
             </p>
           </div>
           <div className="flex flex-col gap-1.5">

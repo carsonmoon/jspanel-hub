@@ -157,6 +157,7 @@
 .pt-hy2 { color: oklch(0.50 0.14 60); background: oklch(0.945 0.035 60); border-color: oklch(0.87 0.06 60); }
 .pt-tuic { color: oklch(0.48 0.11 200); background: oklch(0.94 0.03 200); border-color: oklch(0.86 0.05 200); }
 .pt-anytls { color: oklch(0.50 0.12 155); background: oklch(0.94 0.03 155); border-color: oklch(0.86 0.05 155); }
+.pt-cdn { color: oklch(0.46 0.11 180); background: oklch(0.94 0.03 180); border-color: oklch(0.86 0.05 180); }
 .pt-unknown { color: var(--foreground); border-color: var(--border); }
 .dark .pt-vless { color: oklch(0.72 0.12 258); background: oklch(0.30 0.055 258); border-color: oklch(0.40 0.08 258); }
 .dark .pt-vmess { color: oklch(0.74 0.10 235); background: oklch(0.295 0.04 235); border-color: oklch(0.395 0.055 235); }
@@ -165,6 +166,7 @@
 .dark .pt-hy2 { color: oklch(0.75 0.13 62); background: oklch(0.30 0.05 62); border-color: oklch(0.40 0.075 62); }
 .dark .pt-tuic { color: oklch(0.74 0.10 200); background: oklch(0.29 0.045 200); border-color: oklch(0.39 0.06 200); }
 .dark .pt-anytls { color: oklch(0.72 0.11 155); background: oklch(0.29 0.045 155); border-color: oklch(0.39 0.06 155); }
+.dark .pt-cdn { color: oklch(0.74 0.10 180); background: oklch(0.29 0.045 180); border-color: oklch(0.39 0.06 180); }
 .dark .pt-unknown { color: var(--foreground); border-color: var(--border); }
 
 /* RX-78 日志页语义 chips（与 .pt-* 同饱和度公式）：HTTPS 蓝 / HTTP 橙 / DNS 青 /
