@@ -2153,6 +2153,8 @@ fn proxy_node_view(host: &str, bundle: &crate::db::NodeBundle) -> Value {
         "dns_name": bundle.node.dns_name,
         "dns_server_id": bundle.node.dns_server_id,
         "dns_ip": bundle.node.dns_ip,
+        "ws_path": bundle.node.ws_path,
+        "cert_ready": !bundle.secret.cert_pem.is_empty() && !bundle.secret.key_pem.is_empty(),
         "public_key": bundle.secret.public_key,
         "short_id": bundle.secret.short_id,
         "reality_private_key": if bundle.node.protocol == "vless-reality" { json!(bundle.secret.private_key) } else { Value::Null },
@@ -2339,6 +2341,43 @@ pub async fn delete_proxy_node(_: Admin, State(app): State<Shared>, Path(id): Pa
                 }
             }
             Json(json!({ "ok": true, "applied": applied, "shaper": shaper_err })).into_response()
+        }
+        Err(e) => fail(e),
+    }
+}
+
+#[derive(Deserialize)]
+pub struct ProxyCertBody {
+    pub cert_pem: String,
+    pub key_pem: String,
+}
+
+/// vless-ws 的证书粘贴/轮换（Origin CA 自动签发不可用时的手动通道，或到期
+/// 前 15 年一换）：存进 proxy_secret 后立刻收敛配置——证书内联进入站，
+/// 指纹必变。仅 vless-ws 节点接受。
+pub async fn set_proxy_node_cert(
+    _: Admin,
+    State(app): State<Shared>,
+    Path(id): Path<i64>,
+    body: Result<Json<ProxyCertBody>, JsonRejection>,
+) -> Response {
+    let Ok(Json(b)) = body else {
+        return bad("请求格式不对");
+    };
+    let cert = b.cert_pem.trim().to_owned();
+    let key = b.key_pem.trim().to_owned();
+    if !cert.contains("BEGIN CERTIFICATE") || !key.contains("PRIVATE KEY") {
+        return bad("证书或私钥的 PEM 格式不对（应为 BEGIN CERTIFICATE / PRIVATE KEY 开头的 PEM）");
+    }
+    match app.db.proxy_node(id) {
+        Ok(Some(n)) if n.protocol == "vless-ws" => {}
+        Ok(_) => return bad("只有 CDN 中转（vless-ws）节点需要粘贴证书"),
+        Err(e) => return fail(e),
+    }
+    match app.db.set_proxy_cert(id, "origin-ca", &cert, &key) {
+        Ok(()) => {
+            let applied = proxy::apply_if_ready(&app).await;
+            Json(json!({ "ok": true, "applied": applied })).into_response()
         }
         Err(e) => fail(e),
     }

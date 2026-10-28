@@ -621,6 +621,7 @@ async fn main() -> Result<()> {
         .route("/api/proxy/credentials/random", get(api::proxy_random_credential))
         .route("/api/proxy/nodes/{id}", put(api::update_proxy_node).delete(api::delete_proxy_node))
         .route("/api/proxy/nodes/{id}/switch", post(api::switch_proxy_node))
+        .route("/api/proxy/nodes/{id}/cdn-cert", post(api::set_proxy_node_cert))
         .route("/api/proxy/nodes/{id}/users", post(api::create_proxy_node_user))
         .route("/api/proxy/nodes/{id}/users/{uid}", delete(api::delete_proxy_node_user))
         .route("/api/proxy/users/{uid}/sub", put(api::set_proxy_user_sub))

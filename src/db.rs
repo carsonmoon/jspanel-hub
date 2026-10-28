@@ -360,7 +360,7 @@ CREATE TABLE IF NOT EXISTS session (
 /// 模式，template_name 可为空）。
 /// Bumped to 28（第二次使用）for 订阅文件节点勾选：sub_profiles 加
 /// selected_nodes（勾选的节点 id 数组，非空 = 只包含这些节点）。
-const SCHEMA_VERSION: i64 = 53;
+const SCHEMA_VERSION: i64 = 54;
 
 /// Adds a column older databases lack. A duplicate column indicates the
 /// migration has already run; every other error must propagate.
@@ -1319,6 +1319,15 @@ fn migrate_to_53(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// CDN 中转（vless-ws）：WebSocket 路径列。老形状假库可能没有 proxy_node
+/// 表（守卫先例 v37/v53）。
+fn migrate_to_54(conn: &Connection) -> Result<()> {
+    if !schema_mentions(conn, "proxy_node", "CREATE TABLE")? {
+        return Ok(());
+    }
+    add_column(conn, "proxy_node", "ws_path TEXT NOT NULL DEFAULT ''")
+}
+
 /// 身份归一（grilling Q1–Q5）：「本机」虚拟身份 server_id=0 退役——库里已
 /// 无 0 行，重建两表只为装上最终防线 CHECK，此后任何代码路径都写不进 0；
 /// 「本机」= hostname 等于 hub 的那个节点行。exit_server_id 不加约束：0 是
@@ -1607,6 +1616,9 @@ fn migrate_inner(conn: &Connection, from: i64) -> Result<()> {
     }
     if from < 53 {
         migrate_to_53(&tx)?;
+    }
+    if from < 54 {
+        migrate_to_54(&tx)?;
     }
     let fk_after = fk_violation_rows(conn)?;
     if fk_after.len() > fk_before.len() {
@@ -2034,6 +2046,12 @@ pub struct ProxyNode {
     /// and are intentionally omitted from serialized API responses.
     #[serde(default, skip_serializing)]
     pub uuid: Option<String>,
+    /// Request-only：vless-ws 创建时手动粘贴的 Origin CA 证书对（不落列，
+    /// 直接进 proxy_secret；不填则 hub 经 Cloudflare API 自动签发）。
+    #[serde(default, skip_serializing)]
+    pub cert_pem: Option<String>,
+    #[serde(default, skip_serializing)]
+    pub key_pem: Option<String>,
     #[serde(default, skip_serializing)]
     pub reality_private_key: Option<String>,
     #[serde(default, skip_serializing)]
@@ -2047,6 +2065,9 @@ pub struct ProxyNode {
     /// 换 IP/换主机不再换链接。需托管在 Cloudflare（dns.rs 仅此一家）。
     #[serde(default)]
     pub dns_name: String,
+    /// CDN 中转（vless-ws）的 WebSocket 路径，创建时随机生成；其余协议为空。
+    #[serde(default)]
+    pub ws_path: String,
     /// 域名当前指向的机器 id（切换时更新）；与 server_id 可以不同——
     /// 切走后原机节点照跑，随时一键切回。
     #[serde(default)]
@@ -2631,10 +2652,13 @@ fn row_to_proxy_node(r: &rusqlite::Row) -> rusqlite::Result<ProxyNode> {
         rate_up: r.get("rate_up")?,
         rate_down: r.get("rate_down")?,
         dns_name: r.get("dns_name")?,
+        ws_path: r.get("ws_path")?,
         dns_server_id: r.get("dns_server_id")?,
         dns_ip: r.get("dns_ip")?,
         mirror_servers: r.get("mirror_servers")?,
         uuid: None,
+        cert_pem: None,
+        key_pem: None,
         reality_private_key: None,
         reality_short_id: None,
     })
@@ -2915,11 +2939,11 @@ impl Db {
         let node_id = match tx.execute(
             "INSERT INTO proxy_node (name, protocol, listen_port, sni, flow, method, enabled, remark, created_at,
                                       server_id, egress_type, egress_host, egress_port, egress_username, egress_password,
-                                      rate_up, rate_down, dns_name, dns_server_id)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?10)",
+                                      rate_up, rate_down, dns_name, dns_server_id, ws_path)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?10,?19)",
             params![n.name, n.protocol, n.listen_port, n.sni, n.flow, n.method, n.enabled as i64, n.remark, created,
                     n.server_id, n.egress_type, n.egress_host, n.egress_port, n.egress_username, n.egress_password,
-                    n.rate_up, n.rate_down, n.dns_name.trim()],
+                    n.rate_up, n.rate_down, n.dns_name.trim(), n.ws_path.trim()],
         ) {
             Ok(_) => tx.last_insert_rowid(),
             Err(e) if e.to_string().contains("UNIQUE constraint failed") => {
@@ -2968,11 +2992,11 @@ impl Db {
         let res = tx.execute(
             "UPDATE proxy_node SET name=?2, protocol=?3, listen_port=?4, sni=?5, flow=?6, method=?7, enabled=?8, remark=?9,
                                    server_id=?10, egress_type=?11, egress_host=?12, egress_port=?13, egress_username=?14, egress_password=?15,
-                                   rate_up=?16, rate_down=?17, dns_name=?18
+                                   rate_up=?16, rate_down=?17, dns_name=?18, ws_path=?19
              WHERE id=?1",
             params![n.id, n.name, n.protocol, n.listen_port, n.sni, n.flow, n.method, n.enabled as i64, n.remark,
                     n.server_id, n.egress_type, n.egress_host, n.egress_port, n.egress_username, n.egress_password,
-                    n.rate_up, n.rate_down, n.dns_name.trim()],
+                    n.rate_up, n.rate_down, n.dns_name.trim(), n.ws_path.trim()],
         )?;
         if res == 0 {
             return Err(anyhow::Error::msg(crate::Shown("节点不存在，可能已被删除".into())));
@@ -3052,6 +3076,20 @@ impl Db {
         }
         tx.execute("DELETE FROM proxy_node WHERE id = ?1", [id])?;
         tx.commit()?;
+        Ok(())
+    }
+
+    /// vless-ws 的 Origin CA 证书对落 secret 行的证书列（先例 selfsign 的
+    /// 存放方式）。证书经面板粘贴/轮换时调用；tls_mode 一并改写。
+    pub fn set_proxy_cert(&self, node_id: i64, tls_mode: &str, cert_pem: &str, key_pem: &str) -> Result<()> {
+        let conn = self.conn();
+        let res = conn.execute(
+            "UPDATE proxy_secret SET tls_mode=?2, cert_pem=?3, key_pem=?4 WHERE node_id=?1",
+            params![node_id, tls_mode, cert_pem, key_pem],
+        )?;
+        if res == 0 {
+            return Err(anyhow::Error::msg(crate::Shown("节点不存在，可能已被删除".into())));
+        }
         Ok(())
     }
 
@@ -7719,6 +7757,28 @@ mod tests {
         db.update_proxy_node(&cleared, None, None).unwrap();
         let got = db.proxy_node(id).unwrap().unwrap();
         assert_eq!((got.rate_up, got.rate_down), (0, 0));
+    }
+
+    /// ws_path（vless-ws 的 WebSocket 路径）走 create/update 落库闭环：
+    /// UPDATE 是显式列名，漏列即静默清空（教训同 static_content 事件）。
+    #[test]
+    fn proxy_ws_path_round_trips_through_the_database() {
+        let db = db();
+        let node = ProxyNode {
+            name: "cdn".into(),
+            protocol: "vless-ws".into(),
+            listen_port: 8443,
+            server_id: 3,
+            dns_name: "c1.example.com".into(),
+            ws_path: "/abc".into(),
+            ..Default::default()
+        };
+        let id = db.create_proxy_node(&node, &ProxySecret::default(), "secret").unwrap();
+        assert_eq!(db.proxy_node(id).unwrap().unwrap().ws_path, "/abc");
+        let got = db.proxy_node(id).unwrap().unwrap();
+        let cleared = ProxyNode { ws_path: String::new(), ..got };
+        db.update_proxy_node(&cleared, None, None).unwrap();
+        assert_eq!(db.proxy_node(id).unwrap().unwrap().ws_path, "");
     }
 
     /// 改端口（或挪服务器）必须带着历史走：采样与连接日志以

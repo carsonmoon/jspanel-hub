@@ -31,7 +31,7 @@ fn shown<S: std::fmt::Display>(msg: S) -> anyhow::Error {
 
 /// Cloudflare upsert：在 token 可见的 zone 里按 FQDN 后缀匹配域名，A 记录
 /// 存在则改写、不存在则创建。
-async fn cloudflare_upsert_a(token: &str, fqdn: &str, ip: &str) -> anyhow::Result<()> {
+async fn cloudflare_upsert_a(token: &str, fqdn: &str, ip: &str, proxied: bool) -> anyhow::Result<()> {
     let client = client()?;
     let auth = ("Authorization", format!("Bearer {token}"));
     let zones: serde_json::Value = client
@@ -72,10 +72,15 @@ async fn cloudflare_upsert_a(token: &str, fqdn: &str, ip: &str) -> anyhow::Resul
         .json()
         .await
         .map_err(|e| shown(format!("解析 DNS 记录失败：{e}")))?;
-    // TTL 60（免费套餐下限）：切换/故障转移后客户端恢复时长由缓存剩余时间
-    // 决定，短 TTL 直接压缩断连窗口；查询量在本项目规模下可忽略。
-    // proxied=false：reality/vless 是非 HTTP 流量，过不了 CDN 代理。
-    let body = serde_json::json!({ "type": "A", "name": fqdn, "content": ip, "ttl": 60, "proxied": false });
+    // 灰云（DNS-only）：TTL 60（免费套餐下限）——切换/故障转移后客户端恢复
+    // 时长由缓存剩余时间决定，短 TTL 直接压缩断连窗口；查询量在本项目规模
+    // 下可忽略。reality 等非 HTTP 流量过不了 CDN 代理，直连域名一律灰云。
+    // 小黄云（proxied，vless-ws 的 CDN 中转）：Cloudflare 强制 ttl=1（auto），
+    // 写 60 会被拒。
+    let body = serde_json::json!({
+        "type": "A", "name": fqdn, "content": ip,
+        "ttl": if proxied { 1 } else { 60 }, "proxied": proxied
+    });
     let base = format!("{CF_API}/zones/{zone_id}/dns_records");
     let pending = match records["result"][0]["id"].as_str() {
         Some(id) => client.patch(format!("{base}/{id}")).header(auth.0, auth.1).json(&body),
@@ -96,6 +101,82 @@ async fn cloudflare_upsert_a(token: &str, fqdn: &str, ip: &str) -> anyhow::Resul
     Ok(())
 }
 
+/// 签发 Cloudflare Origin CA 证书（vless-ws 的 CDN 中转用）：15 年有效期，
+/// 私钥在本地生成（rcgen），CSR 上呈、证书回存 proxy_secret。认证两条路：
+/// API Token（需 Origin CA 权限）→ 失败再试设置页的 Origin CA Key
+/// （X-Auth-User-Service-Key，仪表盘「我的个人资料 → API 令牌」页可取）。
+/// 两条路都不通则报错指引手动粘贴。
+pub async fn issue_origin_ca(app: &crate::App, fqdn: &str) -> anyhow::Result<(String, String)> {
+    if let Some(stub) = origin_ca_stub().as_ref() {
+        return stub(fqdn);
+    }
+    let key = rcgen::KeyPair::generate().map_err(|e| shown(format!("生成证书密钥失败：{e}")))?;
+    let params = rcgen::CertificateParams::new(vec![fqdn.to_owned()])
+        .map_err(|e| shown(format!("证书参数无效：{e}")))?;
+    let csr = params.serialize_request(&key).map_err(|e| shown(format!("生成 CSR 失败：{e}")))?;
+    let csr_pem = csr.pem().map_err(|e| shown(format!("编码 CSR 失败：{e}")))?;
+    let body = serde_json::json!({
+        "hostnames": [fqdn], "requested_validity": 5475, "request_type": "origin-rsa",
+        "csr": csr_pem,
+    });
+    let client = client()?;
+    let token = token(app);
+    let post = |header: (&'static str, String)| {
+        client.post(format!("{CF_API}/certificates")).header(header.0, header.1).json(&body)
+    };
+    let mut via = "API Token";
+    let resp = post(("Authorization", format!("Bearer {token}")))
+        .send()
+        .await
+        .map_err(|e| shown(format!("请求 Cloudflare 签发证书失败：{e}")))?;
+    // Token 无 Origin CA 权限时 Cloudflare 回 400/403；换 Origin CA Key 再试。
+    let resp = if matches!(resp.status().as_u16(), 400 | 403) {
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        let origin_key = app.db.get("cf_origin_ca_key").unwrap_or_default();
+        if origin_key.is_empty() {
+            return Err(shown(format!(
+                "API Token 签发 Origin CA 证书被拒（{status}：{text}）。两条路任选其一：\
+                 ① 设置页填 Origin CA Key（Cloudflare 仪表盘 → My Profile → API Tokens → Origin Keys）；\
+                 ② 在节点对话框手动粘贴证书"
+            )));
+        }
+        via = "Origin CA Key";
+        post(("X-Auth-User-Service-Key", origin_key))
+            .send()
+            .await
+            .map_err(|e| shown(format!("请求 Cloudflare 签发证书失败：{e}")))?
+    } else {
+        resp
+    };
+    let v: serde_json::Value = resp
+        .error_for_status()
+        .map_err(|e| shown(format!("Cloudflare 拒绝了证书签发（{via} 认证）：{e}")))?
+        .json()
+        .await
+        .map_err(|e| shown(format!("解析证书签发应答失败：{e}")))?;
+    let cert = v["result"]["certificate"]
+        .as_str()
+        .ok_or_else(|| shown(format!("Cloudflare 未返回证书：{}", v["errors"])))?
+        .to_owned();
+    Ok((cert, key.serialize_pem()))
+}
+
+/// Origin CA 签发测试桩（与 upsert 桩同款思路：无 mock HTTP 基座）。
+pub type OriginCaStub = std::sync::Arc<dyn Fn(&str) -> anyhow::Result<(String, String)> + Send + Sync>;
+
+fn origin_ca_stub() -> std::sync::MutexGuard<'static, Option<OriginCaStub>> {
+    use std::sync::OnceLock;
+    static M: OnceLock<std::sync::Mutex<Option<OriginCaStub>>> = OnceLock::new();
+    M.get_or_init(|| std::sync::Mutex::new(None)).lock().unwrap()
+}
+
+/// 测试注入点（仅测试目标可见）。
+#[cfg(test)]
+pub fn set_origin_ca_stub(stub: Option<OriginCaStub>) {
+    *origin_ca_stub() = stub;
+}
+
 fn set_suppressed_fn(node_id: i64, on: bool) {
     let mut m = suppressed_fn();
     if on {
@@ -112,8 +193,8 @@ fn suppressed_fn() -> std::sync::MutexGuard<'static, std::collections::HashSet<i
 }
 
 /// upsert 测试桩：设了就不发真实 HTTP（dns.rs 无 mock HTTP 基座，切换
-/// 主机/跟随同步的单测靠它断言「翻没翻、翻去了哪」）。
-pub type UpsertStub = std::sync::Arc<dyn Fn(&str, &str, &str) -> anyhow::Result<()> + Send + Sync>;
+/// 主机/跟随同步的单测靠它断言「翻没翻、翻去了哪、开没开小黄云」）。
+pub type UpsertStub = std::sync::Arc<dyn Fn(&str, &str, &str, bool) -> anyhow::Result<()> + Send + Sync>;
 
 fn upsert_stub() -> std::sync::MutexGuard<'static, Option<UpsertStub>> {
     use std::sync::OnceLock;
@@ -128,12 +209,13 @@ pub fn set_upsert_stub(stub: Option<UpsertStub>) {
 }
 
 /// 所有 A 记录写入的统一入口（入口故障转移翻转 / 机器 DDNS 同步 /
-/// 代理节点域名翻转与跟随）：测试注入点。
-async fn upsert_a(token: &str, fqdn: &str, ip: &str) -> anyhow::Result<()> {
+/// 代理节点域名翻转与跟随）：测试注入点。`proxied` = 小黄云（vless-ws 的
+/// CDN 中转域名），灰云记录恒传 false。
+async fn upsert_a(token: &str, fqdn: &str, ip: &str, proxied: bool) -> anyhow::Result<()> {
     if let Some(stub) = upsert_stub().as_ref() {
-        return stub(token, fqdn, ip);
+        return stub(token, fqdn, ip, proxied);
     }
-    cloudflare_upsert_a(token, fqdn, ip).await
+    cloudflare_upsert_a(token, fqdn, ip, proxied).await
 }
 
 /// 入口故障转移专用：绕过节点自身的 dns_ip 记账，直接把 FQDN 指到指定 IP。
@@ -153,7 +235,7 @@ pub async fn flip_a(app: &crate::App, node_id: i64, target_ip: &str) -> anyhow::
         fqdn
     };
     set_suppressed_fn(node_id, true);
-    upsert_a(&token(app), &fqdn, target_ip).await?;
+    upsert_a(&token(app), &fqdn, target_ip, false).await?;
     app.db.update_dns_ip(node_id, target_ip)?;
     Ok(())
 }
@@ -188,15 +270,16 @@ pub async fn sync_node(app: &crate::App, node_id: i64) -> anyhow::Result<String>
     if ip == dns_ip {
         return Ok(ip.to_owned());
     }
-    upsert_a(&token(app), fqdn, ip).await?;
+    upsert_a(&token(app), fqdn, ip, false).await?;
     app.db.update_dns_ip(node_id, ip)?;
     Ok(ip.to_owned())
 }
 
 /// 切换主机落地：把节点自有域名（proxy_node.dns_name）的 A 记录翻到目标
 /// IP。调用方（switch_node）保证 token/fqdn 已校验；指向记账由它一并落库。
-pub async fn flip_proxy_node(app: &crate::App, fqdn: &str, ip: &str) -> anyhow::Result<()> {
-    upsert_a(&token(app), fqdn, ip).await
+/// `proxied`：vless-ws 的 CDN 域名开小黄云，其余灰云。
+pub async fn flip_proxy_node(app: &crate::App, fqdn: &str, ip: &str, proxied: bool) -> anyhow::Result<()> {
+    upsert_a(&token(app), fqdn, ip, proxied).await
 }
 
 /// 代理节点域名跟随（切换主机）：把「绑了域名、但 A 记录落后于指向机器
@@ -221,7 +304,10 @@ pub async fn sync_proxy_node_domains(app: &crate::App) {
         if ip.is_empty() || ip == n.dns_ip.trim() {
             continue;
         }
-        match upsert_a(&token(app), &fqdn, &ip).await {
+        // vless-ws 的域名是小黄云记录，跟随同步必须带着 proxied 语义重写，
+        // 否则一次自愈就把 CDN 通道打回灰云。
+        let proxied = n.protocol == "vless-ws";
+        match upsert_a(&token(app), &fqdn, &ip, proxied).await {
             Ok(()) => {
                 let _ = app.db.update_proxy_dns_ip(n.id, &ip);
                 crate::proxy::notify_throttled(app, "ddns", "节点域名已更新", format!("{} → {}", fqdn, ip));
