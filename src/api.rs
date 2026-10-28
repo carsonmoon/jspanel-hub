@@ -2330,9 +2330,26 @@ pub async fn update_proxy_node(
 }
 
 pub async fn delete_proxy_node(_: Admin, State(app): State<Shared>, Path(id): Path<i64>) -> Response {
+    // vless-ws 的小黄云记录随节点一起走：留着就是一条永远 502 的 proxied
+    // 孤儿记录（还占着 c{n} 编号）。失败不挡删除（后台告警）。
+    let cdn_dns = app
+        .db
+        .proxy_node(id)
+        .ok()
+        .flatten()
+        .filter(|n| n.protocol == "vless-ws" && !n.dns_name.trim().is_empty())
+        .map(|n| n.dns_name.trim().to_owned());
     let server_id = app.db.proxy_node(id).ok().flatten().map(|n| n.server_id);
     match app.db.delete_proxy_node(id) {
         Ok(()) => {
+            if let Some(fqdn) = cdn_dns {
+                let app2 = app.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = crate::dns::delete_a(&app2, &fqdn).await {
+                        tracing::warn!("[proxy] CDN 域名 {fqdn} 的 DNS 记录清理失败: {e:#}");
+                    }
+                });
+            }
             let applied = proxy::apply_if_ready(&app).await;
             let mut shaper_err = None;
             if let Some(sid) = server_id {

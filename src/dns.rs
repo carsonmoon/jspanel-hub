@@ -177,6 +177,83 @@ pub fn set_origin_ca_stub(stub: Option<OriginCaStub>) {
     *origin_ca_stub() = stub;
 }
 
+/// token 可见的第一个 zone 名（cdn 域名基础域的取值来源）。查询失败/
+/// 无 zone 返回 None，由调用方走下一级回退。
+pub async fn zone_name(app: &crate::App) -> Option<String> {
+    let client = client().ok()?;
+    let token = token(app);
+    let zones: serde_json::Value = client
+        .get(format!("{CF_API}/zones?per_page=5"))
+        .header("Authorization", format!("Bearer {token}"))
+        .send()
+        .await
+        .ok()?
+        .error_for_status()
+        .ok()?
+        .json()
+        .await
+        .ok()?;
+    zones["result"][0]["name"].as_str().map(ToOwned::to_owned)
+}
+
+/// 删除一条 A 记录（vless-ws 节点删除时清掉小黄云孤儿记录）。记录不
+/// 存在视为成功（幂等）。
+pub async fn delete_a(app: &crate::App, fqdn: &str) -> anyhow::Result<()> {
+    let client = client()?;
+    let auth = ("Authorization", format!("Bearer {}", token(app)));
+    let zones: serde_json::Value = client
+        .get(format!("{CF_API}/zones?per_page=50"))
+        .header(auth.0, auth.1.clone())
+        .send()
+        .await
+        .map_err(|e| shown(format!("无法访问 Cloudflare：{e}")))?
+        .error_for_status()
+        .map_err(|e| shown(format!("Cloudflare 拒绝了请求（Token 无效或权限不足）：{e}")))?
+        .json()
+        .await
+        .map_err(|e| shown(format!("解析 Cloudflare zone 列表失败：{e}")))?;
+    let zone_id = zones["result"]
+        .as_array()
+        .and_then(|zs| {
+            zs.iter()
+                .filter_map(|z| {
+                    let name = z["name"].as_str()?;
+                    let id = z["id"].as_str()?.to_owned();
+                    (fqdn == name || fqdn.ends_with(&format!(".{name}"))).then_some(id)
+                })
+                .next()
+        })
+        .ok_or_else(|| shown(format!("Token 可见的域名里没有能匹配 {fqdn} 的 zone")))?;
+    let records: serde_json::Value = client
+        .get(format!("{CF_API}/zones/{zone_id}/dns_records?type=A&name={fqdn}"))
+        .header(auth.0, auth.1.clone())
+        .send()
+        .await
+        .map_err(|e| shown(format!("查询 DNS 记录失败：{e}")))?
+        .error_for_status()
+        .map_err(|e| shown(format!("查询 DNS 记录失败：{e}")))?
+        .json()
+        .await
+        .map_err(|e| shown(format!("解析 DNS 记录失败：{e}")))?;
+    for id in records["result"].as_array().into_iter().flatten().filter_map(|r| r["id"].as_str()) {
+        let v: serde_json::Value = client
+            .delete(format!("{CF_API}/zones/{zone_id}/dns_records/{id}"))
+            .header(auth.0, auth.1.clone())
+            .send()
+            .await
+            .map_err(|e| shown(format!("删除 DNS 记录失败：{e}")))?
+            .error_for_status()
+            .map_err(|e| shown(format!("Cloudflare 拒绝了 DNS 删除：{e}")))?
+            .json()
+            .await
+            .map_err(|e| shown(format!("解析 DNS 删除应答失败：{e}")))?;
+        if v["success"].as_bool() != Some(true) {
+            return Err(shown(format!("Cloudflare 返回失败：{}", v["errors"])));
+        }
+    }
+    Ok(())
+}
+
 fn set_suppressed_fn(node_id: i64, on: bool) {
     let mut m = suppressed_fn();
     if on {

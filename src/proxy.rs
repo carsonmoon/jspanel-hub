@@ -255,31 +255,42 @@ fn allocate_cdn_port(app: &App, server_id: i64) -> Result<i64> {
     })
 }
 
-/// vless-ws 自动域名的基础域：设置 cdn_base_domain 优先；否则从库内已有
-/// 域名（代理节点或机器）剥掉最左段推得——生产里 p1/n1 同 zone，推出即对。
-fn cdn_base_domain(app: &App) -> Result<String> {
+/// vless-ws 自动域名的基础域，取值顺序：
+/// ① 设置 cdn_base_domain；② token 可见的 Cloudflare zone 名（一级子域
+/// 必须落在 zone 直下——Universal SSL 只覆盖 zone 与一级子域，c1.cc.x.de
+/// 这类二级子域边缘没有证书，TLS 握手直接失败）；③ 无 token 时从库内
+/// 已有域名剥掉最左两段推得（p1.cc.baoco.de → baoco.de）。
+async fn cdn_base_domain(app: &App) -> Result<String> {
     if let Some(base) = app.db.get("cdn_base_domain").map(|v| v.trim().to_owned()).filter(|v| !v.is_empty()) {
         return Ok(base);
     }
-    let strip = |d: &str| d.split_once('.').map(|(_, rest)| rest.to_owned());
+    if crate::dns::configured(app) {
+        if let Some(zone) = crate::dns::zone_name(app).await {
+            return Ok(zone);
+        }
+    }
+    let strip2 = |d: &str| {
+        let labels: Vec<&str> = d.split('.').collect();
+        (labels.len() > 2).then(|| labels[2..].join("."))
+    };
     let candidates = app
         .db
         .proxy_nodes()?
         .iter()
-        .filter_map(|n| strip(n.dns_name.trim()))
-        .chain(app.db.nodes()?.iter().filter_map(|n| strip(n.dns_name.trim())))
+        .filter_map(|n| strip2(n.dns_name.trim()))
+        .chain(app.db.nodes()?.iter().filter_map(|n| strip2(n.dns_name.trim())))
         .find(|b| b.contains('.'));
     candidates.ok_or_else(|| {
         anyhow::Error::msg(crate::Shown(
-            "无法推断 CDN 域名的基础域：请先在设置里配置 cdn_base_domain（如 cc.baoco.de）或给任一节点/主机绑定域名".into(),
+            "无法推断 CDN 域名的基础域：请先在设置里配置 cdn_base_domain（如 baoco.de，必须是 Cloudflare zone 本身或其一级子域）".into(),
         ))
     })
 }
 
 /// 下一个可用的 c{n}.{基础域}：编号取已用最大值 +1，并跳过任何同名记录
 /// （含 n1/p1 等人工绑定的域名）。
-fn next_cdn_domain(app: &App) -> Result<String> {
-    let base = cdn_base_domain(app)?;
+async fn next_cdn_domain(app: &App) -> Result<String> {
+    let base = cdn_base_domain(app).await?;
     let taken: HashSet<String> = app
         .db
         .proxy_nodes()?
@@ -486,7 +497,7 @@ pub async fn create_node(app: &Shared, mut node: ProxyNode) -> Result<i64> {
             );
         }
         if node.dns_name.trim().is_empty() {
-            node.dns_name = next_cdn_domain(app)?;
+            node.dns_name = next_cdn_domain(app).await?;
         } else {
             node.dns_name = node.dns_name.trim().to_owned();
         }

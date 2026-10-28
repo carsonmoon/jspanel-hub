@@ -484,10 +484,31 @@ function NodeDialog({ open, initial, servers, onOpenChange, reload }: {
                   </Button>
                 </div>
               </div>
+              <div className="flex flex-col gap-1.5">
+                <Label>证书（可选）</Label>
+                <p className="text-xs text-muted-foreground">
+                  留空自动签发 Cloudflare Origin CA（15 年，需要 Token 有相应权限）；
+                  自动签发不可用时可从 Cloudflare 仪表盘（SSL/TLS → Origin Server）创建后在此粘贴。
+                </p>
+                <textarea
+                  value={certPem}
+                  onChange={(e) => setCertPem(e.target.value)}
+                  placeholder="证书 PEM（-----BEGIN CERTIFICATE----- 开头）"
+                  rows={3}
+                  className="w-full rounded-md border border-input bg-transparent px-3 py-2 font-mono text-xs shadow-xs outline-none placeholder:text-muted-foreground focus-visible:border-ring focus-visible:ring-[3px] focus-visible:ring-ring/50 dark:bg-input/30"
+                />
+                <textarea
+                  value={keyPem}
+                  onChange={(e) => setKeyPem(e.target.value)}
+                  placeholder="私钥 PEM（-----BEGIN PRIVATE KEY----- 开头）"
+                  rows={2}
+                  className="w-full rounded-md border border-input bg-transparent px-3 py-2 font-mono text-xs shadow-xs outline-none placeholder:text-muted-foreground focus-visible:border-ring focus-visible:ring-[3px] focus-visible:ring-ring/50 dark:bg-input/30"
+                />
+              </div>
               {editing && (
                 <div className="rounded-md border p-3">
                   <div className="mb-2 flex items-center gap-2 text-sm font-medium">
-                    证书
+                    当前证书
                     <span
                       className={
                         initial?.cert_ready
@@ -498,28 +519,10 @@ function NodeDialog({ open, initial, servers, onOpenChange, reload }: {
                       {initial?.cert_ready ? "已就绪" : "未就绪"}
                     </span>
                   </div>
-                  <p className="mb-2 text-xs text-muted-foreground">
-                    创建时自动签发 Cloudflare Origin CA（15 年）。自动签发不可用或需轮换时在此粘贴。
-                  </p>
-                  <div className="flex flex-col gap-2">
-                    <textarea
-                      value={certPem}
-                      onChange={(e) => setCertPem(e.target.value)}
-                      placeholder="证书 PEM（-----BEGIN CERTIFICATE----- 开头）"
-                      rows={3}
-                      className="w-full rounded-md border border-input bg-transparent px-3 py-2 font-mono text-xs shadow-xs outline-none placeholder:text-muted-foreground focus-visible:border-ring focus-visible:ring-[3px] focus-visible:ring-ring/50 dark:bg-input/30"
-                    />
-                    <textarea
-                      value={keyPem}
-                      onChange={(e) => setKeyPem(e.target.value)}
-                      placeholder="私钥 PEM（-----BEGIN PRIVATE KEY----- 开头）"
-                      rows={2}
-                      className="w-full rounded-md border border-input bg-transparent px-3 py-2 font-mono text-xs shadow-xs outline-none placeholder:text-muted-foreground focus-visible:border-ring focus-visible:ring-[3px] focus-visible:ring-ring/50 dark:bg-input/30"
-                    />
-                    <Button type="button" size="sm" variant="outline" disabled={busy || !certPem.trim() || !keyPem.trim()} onClick={saveCert}>
-                      保存证书
-                    </Button>
-                  </div>
+                  <p className="mb-2 text-xs text-muted-foreground">在上方粘贴新证书对并点「轮换证书」。</p>
+                  <Button type="button" size="sm" variant="outline" disabled={busy || !certPem.trim() || !keyPem.trim()} onClick={saveCert}>
+                    轮换证书
+                  </Button>
                 </div>
               )}
             </>
