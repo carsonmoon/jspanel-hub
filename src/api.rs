@@ -2365,13 +2365,18 @@ pub async fn delete_proxy_node(_: Admin, State(app): State<Shared>, Path(id): Pa
                 });
             }
             let applied = proxy::apply_if_ready(&app).await;
-            let mut shaper_err = None;
+            // 限速下发后台化（同 update 的做法）：agent 慢/不响应时它要等满
+            // 30s 超时，内联 await 曾把删除响应拖住——前端列表看似没动，
+            // 用户手动刷新才见已删（库里其实早就删了）。
             if let Some(sid) = server_id {
-                if let Err(e) = crate::shaper::apply_for_server(&app, sid).await {
-                    shaper_err = Some(e.to_string());
-                }
+                let app2 = app.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = crate::shaper::apply_for_server(&app2, sid).await {
+                        tracing::warn!("[shaper] delete 后台下发失败: {e:#}");
+                    }
+                });
             }
-            Json(json!({ "ok": true, "applied": applied, "shaper": shaper_err })).into_response()
+            Json(json!({ "ok": true, "applied": applied })).into_response()
         }
         Err(e) => fail(e),
     }
