@@ -257,6 +257,43 @@ fn allocate_cdn_port(app: &App, server_id: i64) -> Result<i64> {
     })
 }
 
+/// 修复复制粘贴损坏的 PEM：换行丢失（整段挤成一行、base64 与
+/// -----BEGIN----- 头之间是空格）是高频事故——「刺激」「888」两次踩中，
+/// sing-box 端报 failed to find any PEM data。抽出每个 BEGIN/END 块的
+/// base64（剔除全部空白字符）重排为标准 64 列；没有 PEM 结构的原样返回，
+/// 让下游校验报它自己的错。截断粘贴（有 BEGIN 无 END）同样原样返回。
+pub fn normalize_pem(input: &str) -> String {
+    let mut out = String::new();
+    let mut rest = input;
+    while let Some(b) = rest.find("-----BEGIN ") {
+        let label_start = b + "-----BEGIN ".len();
+        let Some(hdr_end) = rest[label_start..].find("-----").map(|i| label_start + i + 5) else { break };
+        let header = &rest[b..hdr_end];
+        let Some(e) = rest[hdr_end..].find("-----END ").map(|i| hdr_end + i) else { break };
+        let label_end = e + "-----END ".len();
+        let Some(ftr_end) = rest[label_end..].find("-----").map(|i| label_end + i + 5) else { break };
+        let footer = &rest[e..ftr_end];
+        let body: String = rest[hdr_end..e].chars().filter(|c| !c.is_whitespace()).collect();
+        if !out.is_empty() && !out.ends_with('\n') {
+            out.push('\n');
+        }
+        out.push_str(header);
+        out.push('\n');
+        for chunk in body.as_bytes().chunks(64) {
+            out.push_str(std::str::from_utf8(chunk).unwrap_or_default());
+            out.push('\n');
+        }
+        out.push_str(footer);
+        out.push('\n');
+        rest = &rest[ftr_end..];
+    }
+    if out.is_empty() {
+        input.to_owned()
+    } else {
+        out
+    }
+}
+
 /// vless-ws 自动域名的基础域，取值顺序：
 /// ① 设置 cdn_base_domain；② token 可见的 Cloudflare zone 名（一级子域
 /// 必须落在 zone 直下——Universal SSL 只覆盖 zone 与一级子域，c1.cc.x.de
@@ -525,7 +562,8 @@ pub async fn create_node(app: &Shared, mut node: ProxyNode) -> Result<i64> {
         ) {
             // 优先级：本次请求手动粘贴 > 设置里的共享证书 > Origin CA
             // 自动签发（不可用时其报错自带两条出路指引）。
-            (Some(c), Some(k)) => (c.to_owned(), k.to_owned()),
+            // 粘贴的 PEM 先过格式修复：换行丢成空格的坏件直接救活。
+            (Some(c), Some(k)) => (normalize_pem(c), normalize_pem(k)),
             _ => match shared_cdn_cert(app) {
                 Some(pair) => pair,
                 None => crate::dns::issue_origin_ca(app, &node.dns_name).await?,
@@ -4195,6 +4233,34 @@ mod tests {
         assert!(yaml.contains("server: c1.example.com"), "{yaml}");
         assert!(yaml.contains("path: /ws"), "{yaml}");
         assert!(!yaml.contains("main.example.com"), "{yaml}");
+    }
+
+    /// 粘贴损坏的 PEM（换行丢成空格/整段一行）自动修复：「刺激」「888」
+    /// 两次事故的回归；完好 PEM 幂等，非 PEM/截断粘贴原样返回。
+    #[test]
+    fn pasted_pem_with_lost_newlines_is_repaired() {
+        let mangled = "-----BEGIN CERTIFICATE----- MIIabc def/+9= ghi== -----END CERTIFICATE-----";
+        assert_eq!(
+            normalize_pem(mangled),
+            "-----BEGIN CERTIFICATE-----\nMIIabcdef/+9=ghi==\n-----END CERTIFICATE-----\n"
+        );
+        let key = "-----BEGIN PRIVATE KEY-----   MC4CAQAw  -----END PRIVATE KEY-----";
+        assert_eq!(normalize_pem(key), "-----BEGIN PRIVATE KEY-----\nMC4CAQAw\n-----END PRIVATE KEY-----\n");
+        // 链式双块各自修复。
+        let chain = format!("{mangled}\n{key}");
+        let fixed = normalize_pem(&chain);
+        assert!(fixed.contains("MIIabcdef/+9=ghi=="));
+        assert!(fixed.contains("MC4CAQAw"));
+        assert_eq!(fixed.matches("-----BEGIN").count(), 2);
+        // 完好 PEM 幂等。
+        let good = "-----BEGIN CERTIFICATE-----\nabc\n-----END CERTIFICATE-----\n";
+        assert_eq!(normalize_pem(good), good);
+        // 非 PEM / 截断粘贴原样返回。
+        assert_eq!(normalize_pem("随手乱粘"), "随手乱粘");
+        assert_eq!(
+            normalize_pem("-----BEGIN CERTIFICATE----- MIIabc (没有结尾)"),
+            "-----BEGIN CERTIFICATE----- MIIabc (没有结尾)"
+        );
     }
 
     #[test]

@@ -2109,7 +2109,12 @@ pub async fn save_settings(
             }
             continue;
         }
-        if let Err(e) = app.db.set(key, value) {
+        // CDN 共享证书：粘贴 PEM 同样先过格式修复（同 cdn-cert 端点）。
+        let mut value = value.to_owned();
+        if key == "cdn_cert_pem" || key == "cdn_key_pem" {
+            value = crate::proxy::normalize_pem(&value);
+        }
+        if let Err(e) = app.db.set(key, &value) {
             return fail(e);
         }
     }
@@ -2400,8 +2405,10 @@ pub async fn set_proxy_node_cert(
     let Ok(Json(b)) = body else {
         return bad("请求格式不对");
     };
-    let cert = b.cert_pem.trim().to_owned();
-    let key = b.key_pem.trim().to_owned();
+    // 粘贴的 PEM 先过格式修复：换行丢成空格的坏件直接救活（「刺激」「888」
+    // 两次踩中同一坑），修不动的原样落库让 sing-box 校验报它自己的错。
+    let cert = proxy::normalize_pem(b.cert_pem.trim());
+    let key = proxy::normalize_pem(b.key_pem.trim());
     if !cert.contains("BEGIN CERTIFICATE") || !key.contains("PRIVATE KEY") {
         return bad("证书或私钥的 PEM 格式不对（应为 BEGIN CERTIFICATE / PRIVATE KEY 开头的 PEM）");
     }

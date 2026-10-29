@@ -360,7 +360,7 @@ CREATE TABLE IF NOT EXISTS session (
 /// 模式，template_name 可为空）。
 /// Bumped to 28（第二次使用）for 订阅文件节点勾选：sub_profiles 加
 /// selected_nodes（勾选的节点 id 数组，非空 = 只包含这些节点）。
-const SCHEMA_VERSION: i64 = 54;
+const SCHEMA_VERSION: i64 = 55;
 
 /// Adds a column older databases lack. A duplicate column indicates the
 /// migration has already run; every other error must propagate.
@@ -1328,6 +1328,22 @@ fn migrate_to_54(conn: &Connection) -> Result<()> {
     add_column(conn, "proxy_node", "ws_path TEXT NOT NULL DEFAULT ''")
 }
 
+/// 删除节点的级联清理从未生效：hub 连接没开 PRAGMA foreign_keys（迁移
+/// 事务里的开关只盖迁移自身），proxy_node 行删掉后 secret（含私钥/证书）
+/// 与凭据永远残留。历史孤儿在此清一次，此后 delete_proxy_node 显式带走。
+fn migrate_to_55(conn: &Connection) -> Result<()> {
+    if !schema_mentions(conn, "proxy_node", "CREATE TABLE")? {
+        return Ok(());
+    }
+    if schema_mentions(conn, "proxy_secret", "CREATE TABLE")? {
+        conn.execute("DELETE FROM proxy_secret WHERE node_id NOT IN (SELECT id FROM proxy_node)", [])?;
+    }
+    if schema_mentions(conn, "proxy_user", "CREATE TABLE")? {
+        conn.execute("DELETE FROM proxy_user WHERE node_id NOT IN (SELECT id FROM proxy_node)", [])?;
+    }
+    Ok(())
+}
+
 /// 身份归一（grilling Q1–Q5）：「本机」虚拟身份 server_id=0 退役——库里已
 /// 无 0 行，重建两表只为装上最终防线 CHECK，此后任何代码路径都写不进 0；
 /// 「本机」= hostname 等于 hub 的那个节点行。exit_server_id 不加约束：0 是
@@ -1619,6 +1635,9 @@ fn migrate_inner(conn: &Connection, from: i64) -> Result<()> {
     }
     if from < 54 {
         migrate_to_54(&tx)?;
+    }
+    if from < 55 {
+        migrate_to_55(&tx)?;
     }
     let fk_after = fk_violation_rows(conn)?;
     if fk_after.len() > fk_before.len() {
@@ -3052,8 +3071,13 @@ impl Db {
     pub fn delete_proxy_node(&self, id: i64) -> Result<()> {
         let mut conn = self.conn();
         let tx = conn.transaction()?;
+        // 级联删除从未生效（hub 连接没开 PRAGMA foreign_keys，见
+        // migrate_to_55）：secret 含私钥/证书、proxy_user 是客户凭据，
+        // 必须显式带走，否则永久残留。
+        tx.execute("DELETE FROM proxy_secret WHERE node_id = ?1", [id])?;
+        tx.execute("DELETE FROM proxy_user WHERE node_id = ?1", [id])?;
         // Proxy traffic samples historically use `server_id + in-{port}` as
-        // their key. Remove those samples with the node so a later node that
+        // the key. Remove those samples with the node so a later node that
         // reuses the port starts with a fresh history. Mirror machines carry
         // the same tag under their own server_id — sweep them too.
         let identity = tx
@@ -7779,6 +7803,47 @@ mod tests {
         let cleared = ProxyNode { ws_path: String::new(), ..got };
         db.update_proxy_node(&cleared, None, None).unwrap();
         assert_eq!(db.proxy_node(id).unwrap().unwrap().ws_path, "");
+    }
+
+    /// 删除节点必须显式带走 secret（含私钥/证书）与凭据：级联从未生效
+    /// （hub 连接没开 PRAGMA foreign_keys），曾永久残留已删节点的私钥。
+    #[test]
+    fn deleting_a_node_takes_its_secret_and_credentials_along() {
+        let db = db();
+        let node = ProxyNode {
+            name: "hk".into(),
+            protocol: "vless-reality".into(),
+            listen_port: 24003,
+            server_id: 3,
+            ..Default::default()
+        };
+        let id = db
+            .create_proxy_node(
+                &node,
+                &ProxySecret { tls_mode: "reality".into(), private_key: "k".into(), ..Default::default() },
+                "cred",
+            )
+            .unwrap();
+        let keep = db
+            .create_proxy_node(
+                &ProxyNode {
+                    name: "keep".into(),
+                    protocol: "vless-reality".into(),
+                    listen_port: 24004,
+                    server_id: 3,
+                    ..Default::default()
+                },
+                &ProxySecret { tls_mode: "reality".into(), private_key: "k2".into(), ..Default::default() },
+                "cred2",
+            )
+            .unwrap();
+        db.delete_proxy_node(id).unwrap();
+        assert!(db.proxy_secret(id).unwrap().is_none(), "被删节点的 secret 必须清掉");
+        // 幸存节点不受牵连。
+        assert_eq!(db.proxy_secret(keep).unwrap().unwrap().private_key, "k2");
+        let bundles = db.proxy_node_bundles().unwrap();
+        assert!(bundles.iter().all(|b| b.node.id != id), "节点已删");
+        assert!(bundles.iter().any(|b| b.node.id == keep && !b.users.is_empty()), "幸存节点凭据完好");
     }
 
     /// 改端口（或挪服务器）必须带着历史走：采样与连接日志以
