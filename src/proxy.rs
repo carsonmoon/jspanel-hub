@@ -236,16 +236,18 @@ fn choose_free_port(pool: &str, used: &HashSet<i64>) -> Result<i64> {
 /// `proxy_port_pool` setting, `20000-50000` unless set otherwise（设计文档 4）.
 fn allocate_port(app: &App, server_id: i64) -> Result<i64> {
     let pool = app.db.get("proxy_port_pool").unwrap_or_else(|| "20000-50000".into());
-    let mut used: HashSet<i64> = proxy_used_ports_scoped(app, server_id)?.into_iter().collect();
+    let mut used: HashSet<i64> = used_ports_on(app, server_id)?.into_iter().collect();
     used.extend(relay_ports_on(app, server_id)?);
     choose_free_port(&pool, &used)
 }
 
 /// vless-ws 的端口分配：不走 20000-50000 随机池（Cloudflare 不回源那些
-/// 端口），在 CF 白名单里按偏好序取首个空闲。占用口径与 allocate_port
-/// 同一份（协议 + 中转，同机两进程抢绑定）。
+/// 端口），在 CF 白名单里按偏好序取首个空闲。占用口径必须用
+/// used_ports_on（含镜像渲染占用）：镜像机同样独占端口，曾因 scoped
+/// 口径漏掉镜像机上的同端口入站，渲染出 duplicate tag 让 agent 永远
+/// 拒绝应用（「刺激」节点事故）。
 fn allocate_cdn_port(app: &App, server_id: i64) -> Result<i64> {
-    let mut used: HashSet<i64> = proxy_used_ports_scoped(app, server_id)?.into_iter().collect();
+    let mut used: HashSet<i64> = used_ports_on(app, server_id)?.into_iter().collect();
     used.extend(relay_ports_on(app, server_id)?);
     CF_HTTPS_PORTS.iter().copied().find(|p| !used.contains(p)).ok_or_else(|| {
         anyhow::Error::msg(crate::Shown(format!(
@@ -546,7 +548,10 @@ pub async fn create_node(app: &Shared, mut node: ProxyNode) -> Result<i64> {
         } else {
             allocate_port(app, node.server_id)?
         };
-    } else if proxy_used_ports_scoped(app, node.server_id)?.contains(&node.listen_port) {
+    } else if used_ports_on(app, node.server_id)?.contains(&node.listen_port) {
+        // 口径必须含镜像渲染占用（同 update_node）：镜像机同样独占端口，
+        // scoped 口径曾放过同端口节点创建，渲染出 duplicate tag 被 agent
+        // 永远拒绝（「刺激」事故）。
         refuse!("端口 {} 已被占用", node.listen_port);
     } else if let Some(rule) = relay_rule_on_port(app, node.server_id, node.listen_port)? {
         refuse!(
@@ -5405,6 +5410,75 @@ mod relay_render_tests {
             assert_eq!(sc.cert_pem, "PASTED-CERT");
             assert_eq!(sc.key_pem, "PASTED-KEY");
 
+            crate::dns::set_upsert_stub(None);
+            crate::dns::set_origin_ca_stub(None);
+        }
+
+        /// 镜像渲染在目标机同样独占端口（「刺激」事故回归）：节点2 家在
+        /// 源机、镜像到备机占 8443 后，备机上 CDN 自动分配必须跳过 8443
+        /// 落到 2053，手动指定 8443 必须拒绝——scoped 口径曾放过，渲染出
+        /// duplicate tag 让 agent 永远拒绝应用。
+        #[tokio::test]
+        async fn cdn_ports_respect_mirror_occupancy() {
+            let _g = STUB_GUARD.lock().await;
+            let (stub, _calls) = stub_upsert();
+            crate::dns::set_upsert_stub(Some(stub));
+            stub_origin_ca();
+            let shared = app_pair();
+            shared.db.set("cf_api_token", "tok").unwrap();
+            shared.db.set("cdn_base_domain", "cc.baoco.de").unwrap();
+            let a = mk_machine(&shared, "源机", "203.0.113.5");
+            let b = mk_machine(&shared, "备机", "203.0.113.6");
+            // 节点2 家在源机、镜像到备机，占 8443。
+            let nid = mk_node(&shared, a, 8443, "");
+            shared.db.add_proxy_node_mirror(nid, b).unwrap();
+
+            // 备机上自动分配：8443 被镜像占用 → 跳到 2053。
+            let id = create_node(
+                &shared,
+                ProxyNode {
+                    name: "CDN线".into(),
+                    protocol: "vless-ws".into(),
+                    server_id: b,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+            assert_eq!(shared.db.proxy_node(id).unwrap().unwrap().listen_port, 2053);
+
+            // 备机上手动指定被占端口：拒绝。
+            let err = create_node(
+                &shared,
+                ProxyNode {
+                    name: "撞口".into(),
+                    protocol: "vless-ws".into(),
+                    server_id: b,
+                    listen_port: 8443,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+            assert!(err.contains("已被占用"), "{err}");
+
+            // 反向同样成立：CDN 线镜像到源机后，源机上普通协议建 2053 也拒。
+            shared.db.add_proxy_node_mirror(id, a).unwrap();
+            let err = create_node(
+                &shared,
+                ProxyNode {
+                    name: "撞口2".into(),
+                    protocol: "socks".into(),
+                    server_id: a,
+                    listen_port: 2053,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+            assert!(err.contains("已被占用"), "{err}");
             crate::dns::set_upsert_stub(None);
             crate::dns::set_origin_ca_stub(None);
         }
