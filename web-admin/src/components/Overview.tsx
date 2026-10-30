@@ -140,8 +140,8 @@ function ThroughputChart({ series, range, shift = 0 }: { series: { bucket: numbe
   const areaDown = `${lineDown} L${x(buckets - 1).toFixed(1)},${baseline} L${x(0).toFixed(1)},${baseline} Z`
   const areaUp = `${lineUp} L${x(buckets - 1).toFixed(1)},${baseline} L${x(0).toFixed(1)},${baseline} Z`
 
-  // 数据点圆点：小点数档位（24h/7d/30d）逐点空心圆；6h 档每分钟一点太密。
-  const showDots = buckets <= 60
+  // 数据点圆点：全档位统一显示（用户口径：各档一致）。密集档点距 ~11px，
+  // r=2.5 空心圆不糊。
 
   // 刻度：每 tickEvery 桶一个 + 末桶「现在」。24h 档零点刻度带日期。
   const pad2 = (n: number) => String(n).padStart(2, "0")
@@ -217,10 +217,8 @@ function ThroughputChart({ series, range, shift = 0 }: { series: { bucket: numbe
           <path d={lineDown} fill="none" stroke="currentColor" strokeWidth="2" className="text-primary" />
           <path d={lineUp} fill="none" stroke="currentColor" strokeWidth="1.75" className="text-up" />
           {/* 数据点：白底描边空心圆（截图的点感来源） */}
-          {showDots &&
-            ptsDown.map((p, i) => <circle key={`d${i}`} cx={p.x} cy={p.y} r="2.5" strokeWidth="1.5" className="fill-background stroke-primary" />)}
-          {showDots &&
-            ptsUp.map((p, i) => <circle key={`u${i}`} cx={p.x} cy={p.y} r="2.5" strokeWidth="1.5" className="fill-background stroke-up" />)}
+          {ptsDown.map((p, i) => <circle key={`d${i}`} cx={p.x} cy={p.y} r="2.5" strokeWidth="1.5" className="fill-background stroke-primary" />)}
+          {ptsUp.map((p, i) => <circle key={`u${i}`} cx={p.x} cy={p.y} r="2.5" strokeWidth="1.5" className="fill-background stroke-up" />)}
           {hoverPoint && hover !== null && (
             <>
               <line x1={x(hover)} x2={x(hover)} y1={PAD} y2={H - PAD} strokeWidth="1" className="stroke-muted-foreground/40" />
