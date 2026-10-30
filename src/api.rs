@@ -2356,7 +2356,7 @@ pub async fn delete_proxy_node(_: Admin, State(app): State<Shared>, Path(id): Pa
         .proxy_node(id)
         .ok()
         .flatten()
-        .filter(|n| n.protocol == "vless-ws" && !n.dns_name.trim().is_empty())
+        .filter(|n| proxy::is_cdn_protocol(&n.protocol) && !n.dns_name.trim().is_empty())
         .map(|n| n.dns_name.trim().to_owned());
     let server_id = app.db.proxy_node(id).ok().flatten().map(|n| n.server_id);
     match app.db.delete_proxy_node(id) {

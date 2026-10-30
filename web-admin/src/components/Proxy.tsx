@@ -63,7 +63,7 @@ export type ProxyNode = {
   dns_ip: string
   /** vless-ws（CDN 中转）的 WebSocket 路径；其余协议为空。 */
   ws_path: string
-  /** vless-ws 证书是否就绪（Origin CA 签发或已粘贴）。 */
+  /** vless-ws 证书是否就绪（Origin CA 签发或已粘贴）；vmess-ws 无证书恒 true。 */
   cert_ready?: boolean
   users: ProxyUser[]
 }
@@ -100,6 +100,7 @@ export type SubUser = {
 export const PROTOCOL_LABEL: Record<string, string> = {
   "vless-reality": "VLESS + Reality",
   "vless-ws": "VLESS + WS（CDN 中转）",
+  "vmess-ws": "VMESS + WS（CDN 中转）",
   hysteria2: "Hysteria 2",
   shadowsocks: "Shadowsocks",
   anytls: "AnyTLS",
@@ -285,10 +286,11 @@ function NodeDialog({ open, initial, servers, onOpenChange, reload }: {
         dns_name: dnsName.trim(),
       }
       if (NEEDS_SNI.has(protocol)) body.sni = sni.trim()
-      if (protocol === "vless-ws") {
+      if (protocol === "vless-ws" || protocol === "vmess-ws") {
         body.ws_path = wsPath.trim()
         if (uuid.trim()) body.uuid = uuid.trim()
-        if (certPem.trim() && keyPem.trim()) {
+        // vmess-ws 明文回源零证书；证书对仅 vless-ws 有。
+        if (protocol === "vless-ws" && certPem.trim() && keyPem.trim()) {
           body.cert_pem = certPem.trim()
           body.key_pem = keyPem.trim()
         }
@@ -468,11 +470,12 @@ function NodeDialog({ open, initial, servers, onOpenChange, reload }: {
               </details>
             </>
           )}
-          {protocol === "vless-ws" && (
+          {(protocol === "vless-ws" || protocol === "vmess-ws") && (
             <>
               <div className="rounded-md border border-primary/30 bg-primary/5 p-3 text-xs text-muted-foreground">
-                CDN 中转：客户端经 Cloudflare 小黄云回源（vless+ws+TLS），服务器 IP
-                被墙封锁、直连不通时客户换用本代理的链接即可恢复；平时可与直连代理并存。
+                CDN 中转：客户端经 Cloudflare 小黄云回源
+                {protocol === "vless-ws" ? "（vless+ws+TLS，证书自动/共享/粘贴三选）" : "（vmess+ws，明文回源零证书，vmess 协议层自带加密）"}
+                ，服务器 IP 被墙封锁、直连不通时客户换用本代理的链接即可恢复；平时可与直连代理并存。
                 需要 Cloudflare API Token（设置页「域名解析」）。
               </div>
               <div className="flex flex-col gap-1.5">
@@ -484,6 +487,7 @@ function NodeDialog({ open, initial, servers, onOpenChange, reload }: {
                   </Button>
                 </div>
               </div>
+              {protocol === "vless-ws" && (
               <div className="flex flex-col gap-1.5">
                 <Label>证书（可选）</Label>
                 <p className="text-xs text-muted-foreground">
@@ -505,7 +509,8 @@ function NodeDialog({ open, initial, servers, onOpenChange, reload }: {
                   className="w-full rounded-md border border-input bg-transparent px-3 py-2 font-mono text-xs shadow-xs outline-none placeholder:text-muted-foreground focus-visible:border-ring focus-visible:ring-[3px] focus-visible:ring-ring/50 dark:bg-input/30"
                 />
               </div>
-              {editing && (
+              )}
+              {protocol === "vless-ws" && editing && (
                 <div className="rounded-md border p-3">
                   <div className="mb-2 flex items-center gap-2 text-sm font-medium">
                     当前证书
@@ -549,12 +554,14 @@ function NodeDialog({ open, initial, servers, onOpenChange, reload }: {
               端口
               {protocol === "vless-ws"
                 ? "（留空自动分配，只支持 8443 / 2053 / 2083 / 2087 / 2096）"
-                : !editing && "（留空从端口池自动分配）"}
+                : protocol === "vmess-ws"
+                  ? "（留空自动分配，只支持 2052 / 2082 / 2086 / 2095 / 8080 / 8880）"
+                  : !editing && "（留空从端口池自动分配）"}
             </Label>
             <Input
               value={port}
               onChange={(e) => setPort(e.target.value)}
-              placeholder={protocol === "vless-ws" ? "8443" : "20000-50000"}
+              placeholder={protocol === "vless-ws" ? "8443" : protocol === "vmess-ws" ? "2052" : "20000-50000"}
               inputMode="numeric"
             />
           </div>
@@ -566,11 +573,13 @@ function NodeDialog({ open, initial, servers, onOpenChange, reload }: {
           )}
           <div className="flex flex-col gap-1.5">
             <Label>
-              {protocol === "vless-ws" ? "CDN 域名（留空自动分配 c{n}，需托管在 Cloudflare）" : "绑定域名（可选，需托管在 Cloudflare）"}
+              {protocol === "vless-ws" || protocol === "vmess-ws"
+                ? "CDN 域名（留空自动分配 c{n}，需托管在 Cloudflare）"
+                : "绑定域名（可选，需托管在 Cloudflare）"}
             </Label>
             <Input value={dnsName} onChange={(e) => setDnsName(e.target.value)} placeholder="例如 c1.example.com" />
             <p className="text-xs text-muted-foreground">
-              {protocol === "vless-ws"
+              {protocol === "vless-ws" || protocol === "vmess-ws"
                 ? "小黄云（proxied）记录由面板自动创建并维护：切换主机时同步翻转，客户链接永不换。"
                 : "绑定后分享链接与二维码改用该域名：IP 被墙时「切换主机」换 IP 不换链接，客户无需重新导入。"}
             </p>

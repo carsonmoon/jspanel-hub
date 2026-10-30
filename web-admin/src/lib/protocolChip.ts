@@ -4,8 +4,9 @@
 const CHIP_BY_PROTOCOL: Record<string, string> = {
   vless: "pt-vless",
   "vless-reality": "pt-vless",
-  // CDN 中转是 vless 的另一形态，但拨号路径完全不同（小黄云），配色独立。
+  // CDN 中转家族（vless-ws/vmess-ws）：拨号路径经小黄云，家族同色。
   "vless-ws": "pt-cdn",
+  "vmess-ws": "pt-cdn",
   vmess: "pt-vmess",
   trojan: "pt-trojan",
   ss: "pt-ss",

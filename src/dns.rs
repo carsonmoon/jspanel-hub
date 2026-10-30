@@ -383,7 +383,7 @@ pub async fn sync_proxy_node_domains(app: &crate::App) {
         }
         // vless-ws 的域名是小黄云记录，跟随同步必须带着 proxied 语义重写，
         // 否则一次自愈就把 CDN 通道打回灰云。
-        let proxied = n.protocol == "vless-ws";
+        let proxied = crate::proxy::is_cdn_protocol(&n.protocol);
         match upsert_a(&token(app), &fqdn, &ip, proxied).await {
             Ok(()) => {
                 let _ = app.db.update_proxy_dns_ip(n.id, &ip);

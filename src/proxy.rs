@@ -25,15 +25,36 @@ use crate::{App, Shared};
 /// Where the sing-box releases are published. Forking implies rebuilding this.
 pub const SINGBOX_REPO: &str = "SagerNet/sing-box";
 
-/// Protocols this build can render configs for. vless-ws = CDN 中转（经
-/// Cloudflare 小黄云的 vless+ws+TLS，抗服务器 IP 被墙）。
-const RENDERABLE: [&str; 7] =
-    ["vless-reality", "vless-ws", "hysteria2", "shadowsocks", "anytls", "socks", "http"];
+/// Protocols this build can render configs for. vless-ws/vmess-ws = CDN 中转
+/// （经 Cloudflare 小黄云的 ws 系，抗服务器 IP 被墙）：前者 ws+TLS 回源
+/// （Full 模式），后者明文 ws 回源（CF HTTP 端口族，零证书）。
+const RENDERABLE: [&str; 8] =
+    ["vless-reality", "vless-ws", "vmess-ws", "hysteria2", "shadowsocks", "anytls", "socks", "http"];
+
+/// CDN 中转协议族：共享小黄云域名/自动成套/切换主机保 proxied 的整套机制。
+pub fn is_cdn_protocol(protocol: &str) -> bool {
+    matches!(protocol, "vless-ws" | "vmess-ws")
+}
 
 /// Cloudflare 小黄云回源只认这些 HTTPS 端口（443 通常被面板的 Caddy 占用，
 /// 不入池）。客户端链接的端口 = 源站端口（CF 同端口透传，不用 Origin
 /// Rules）。vless-ws 的监听端口必须落在池内，创建时按此偏好序取首个空闲。
 const CF_HTTPS_PORTS: [i64; 5] = [8443, 2053, 2083, 2087, 2096];
+
+/// vmess-ws（明文 ws 回源）的端口池：CF 的 HTTP 端口族，CF 用明文 HTTP
+/// 回源到同端口。与 HTTPS 池互不重叠，同机可共存两种 CDN 节点。80 排除
+/// （Caddy/常见 Web 服务占用，不可靠）。此族不受 zone SSL 模式影响——
+/// 绝不能为它把 SSL 模式改成 Flexible（会废掉 vless-ws 的 TLS 回源）。
+const CF_HTTP_PORTS: [i64; 6] = [2052, 2082, 2086, 2095, 8080, 8880];
+
+/// CDN 协议的回源端口池：按协议取各自的 CF 白名单。
+fn cdn_port_pool(protocol: &str) -> &'static [i64] {
+    if protocol == "vmess-ws" {
+        &CF_HTTP_PORTS
+    } else {
+        &CF_HTTPS_PORTS
+    }
+}
 
 /// These borrow a hostname the client sends, so a node cannot exist without
 /// one: Reality pretends to it, the self-signed pair is minted for it.
@@ -192,7 +213,7 @@ fn validate_short_id(value: &str) -> Result<()> {
 /// Shadowsocks-2022 key, or a plain random password.
 fn new_credential(node: &ProxyNode) -> Result<String> {
     Ok(match node.protocol.as_str() {
-        "vless-reality" | "vless-ws" => new_uuid(),
+        "vless-reality" | "vless-ws" | "vmess-ws" => new_uuid(),
         "shadowsocks" => ss_key(&node.method)?,
         _ => new_password(),
     })
@@ -241,18 +262,19 @@ fn allocate_port(app: &App, server_id: i64) -> Result<i64> {
     choose_free_port(&pool, &used)
 }
 
-/// vless-ws 的端口分配：不走 20000-50000 随机池（Cloudflare 不回源那些
-/// 端口），在 CF 白名单里按偏好序取首个空闲。占用口径必须用
+/// CDN 中转的端口分配：不走 20000-50000 随机池（Cloudflare 不回源那些
+/// 端口），在各自协议的 CF 白名单里按偏好序取首个空闲。占用口径必须用
 /// used_ports_on（含镜像渲染占用）：镜像机同样独占端口，曾因 scoped
 /// 口径漏掉镜像机上的同端口入站，渲染出 duplicate tag 让 agent 永远
-/// 拒绝应用（「刺激」节点事故）。
-fn allocate_cdn_port(app: &App, server_id: i64) -> Result<i64> {
+/// 拒绝应用（「刺激」事故）。
+fn allocate_cdn_port(app: &App, server_id: i64, protocol: &str) -> Result<i64> {
+    let pool = cdn_port_pool(protocol);
     let mut used: HashSet<i64> = used_ports_on(app, server_id)?.into_iter().collect();
     used.extend(relay_ports_on(app, server_id)?);
-    CF_HTTPS_PORTS.iter().copied().find(|p| !used.contains(p)).ok_or_else(|| {
+    pool.iter().copied().find(|p| !used.contains(p)).ok_or_else(|| {
         anyhow::Error::msg(crate::Shown(format!(
             "该主机的 Cloudflare 回源端口（{}）已全部被占用，无法再建 CDN 中转",
-            CF_HTTPS_PORTS.iter().map(|p| p.to_string()).collect::<Vec<_>>().join("/")
+            pool.iter().map(|p| p.to_string()).collect::<Vec<_>>().join("/")
         )))
     })
 }
@@ -525,10 +547,11 @@ pub async fn create_node(app: &Shared, mut node: ProxyNode) -> Result<i64> {
     if app.db.node(node.server_id)?.is_none() {
         refuse!("节点所属服务器不存在");
     }
-    // vless-ws（CDN 中转）创建即成套：CF 白名单端口 + 自动小黄云域名 +
-    // proxied A 记录 + Origin CA 证书。缺一环节点就是「渲染必拒」的半成品
-    // （渲染按节点拒绝会连累整台机器的配置），所以任何一环失败都拒绝创建。
-    let cdn = if node.protocol == "vless-ws" {
+    // CDN 中转（vless-ws/vmess-ws）创建即成套：CF 白名单端口 + 自动小黄云
+    // 域名 + proxied A 记录（+ vless-ws 的 Origin CA 证书，vmess-ws 零证书）。
+    // 缺一环节点就是「渲染必拒」的半成品（渲染按节点拒绝会连累整台机器的
+    // 配置），所以任何一环失败都拒绝创建。
+    let cdn = if is_cdn_protocol(&node.protocol) {
         let machine = app.db.node(node.server_id)?.expect("checked above");
         if !crate::dns::configured(app) {
             refuse!("CDN 中转需要 Cloudflare API Token（设置页「域名解析」）");
@@ -537,11 +560,12 @@ pub async fn create_node(app: &Shared, mut node: ProxyNode) -> Result<i64> {
         if ip.is_empty() {
             refuse!("该主机还没有上报公网 IPv4（等 agent 首次上报后再创建）");
         }
+        let pool = cdn_port_pool(&node.protocol);
         // 手动端口先验白名单再签证书，拒绝时不浪费一次 Origin CA 签发。
-        if node.listen_port != 0 && !CF_HTTPS_PORTS.contains(&node.listen_port) {
+        if node.listen_port != 0 && !pool.contains(&node.listen_port) {
             refuse!(
                 "CDN 中转的端口只支持 Cloudflare 回源白名单：{}",
-                CF_HTTPS_PORTS.iter().map(|p| p.to_string()).collect::<Vec<_>>().join(" / ")
+                pool.iter().map(|p| p.to_string()).collect::<Vec<_>>().join(" / ")
             );
         }
         if node.dns_name.trim().is_empty() {
@@ -556,18 +580,25 @@ pub async fn create_node(app: &Shared, mut node: ProxyNode) -> Result<i64> {
         } else {
             node.ws_path = node.ws_path.trim().to_owned();
         }
-        let cert = match (
-            node.cert_pem.as_deref().map(str::trim).filter(|v| !v.is_empty()),
-            node.key_pem.as_deref().map(str::trim).filter(|v| !v.is_empty()),
-        ) {
-            // 优先级：本次请求手动粘贴 > 设置里的共享证书 > Origin CA
-            // 自动签发（不可用时其报错自带两条出路指引）。
-            // 粘贴的 PEM 先过格式修复：换行丢成空格的坏件直接救活。
-            (Some(c), Some(k)) => (normalize_pem(c), normalize_pem(k)),
-            _ => match shared_cdn_cert(app) {
-                Some(pair) => pair,
-                None => crate::dns::issue_origin_ca(app, &node.dns_name).await?,
-            },
+        // vmess-ws 明文 ws 回源，零证书；证书管线仅 vless-ws 有。
+        let cert = if node.protocol == "vless-ws" {
+            Some(
+                match (
+                    node.cert_pem.as_deref().map(str::trim).filter(|v| !v.is_empty()),
+                    node.key_pem.as_deref().map(str::trim).filter(|v| !v.is_empty()),
+                ) {
+                    // 优先级：本次请求手动粘贴 > 设置里的共享证书 > Origin CA
+                    // 自动签发（不可用时其报错自带两条出路指引）。
+                    // 粘贴的 PEM 先过格式修复：换行丢成空格的坏件直接救活。
+                    (Some(c), Some(k)) => (normalize_pem(c), normalize_pem(k)),
+                    _ => match shared_cdn_cert(app) {
+                        Some(pair) => pair,
+                        None => crate::dns::issue_origin_ca(app, &node.dns_name).await?,
+                    },
+                },
+            )
+        } else {
+            None
         };
         Some((ip, cert))
     } else {
@@ -581,8 +612,8 @@ pub async fn create_node(app: &Shared, mut node: ProxyNode) -> Result<i64> {
     }
     let auto_port = node.listen_port == 0;
     if auto_port {
-        node.listen_port = if node.protocol == "vless-ws" {
-            allocate_cdn_port(app, node.server_id)?
+        node.listen_port = if is_cdn_protocol(&node.protocol) {
+            allocate_cdn_port(app, node.server_id, &node.protocol)?
         } else {
             allocate_port(app, node.server_id)?
         };
@@ -614,7 +645,8 @@ pub async fn create_node(app: &Shared, mut node: ProxyNode) -> Result<i64> {
         validate_short_id(short)?;
     }
     let secret = if node.protocol == "vless-ws" {
-        let (_, (cert, key)) = cdn.as_ref().expect("vless-ws 必有证书");
+        let (_, cert) = cdn.as_ref().expect("vless-ws 必有证书");
+        let (cert, key) = cert.as_ref().expect("vless-ws 必有证书");
         ProxySecret {
             tls_mode: "origin-ca".into(),
             cert_pem: cert.clone(),
@@ -625,7 +657,7 @@ pub async fn create_node(app: &Shared, mut node: ProxyNode) -> Result<i64> {
         node_secret(&node, custom_private, custom_short)?
     };
     let credential = match node.uuid.as_deref().filter(|v| !v.trim().is_empty()).map(str::trim) {
-        Some(uuid) if node.protocol == "vless-reality" || node.protocol == "vless-ws" => {
+        Some(uuid) if matches!(node.protocol.as_str(), "vless-reality" | "vless-ws" | "vmess-ws") => {
             if !valid_uuid(uuid) {
                 refuse!("UUID 格式无效");
             }
@@ -639,8 +671,8 @@ pub async fn create_node(app: &Shared, mut node: ProxyNode) -> Result<i64> {
         match app.db.create_proxy_node(&node, &secret, &credential) {
             Ok(id) => break id,
             Err(e) if auto_port && e.to_string().contains("端口") => {
-                node.listen_port = if node.protocol == "vless-ws" {
-                    allocate_cdn_port(app, node.server_id)?
+                node.listen_port = if is_cdn_protocol(&node.protocol) {
+                    allocate_cdn_port(app, node.server_id, &node.protocol)?
                 } else {
                     allocate_port(app, node.server_id)?
                 };
@@ -665,14 +697,15 @@ pub async fn create_node(app: &Shared, mut node: ProxyNode) -> Result<i64> {
 /// checked here for the friendly wording, the schema enforces it regardless.
 pub async fn update_node(app: &Shared, mut node: ProxyNode) -> Result<()> {
     check_common(&node)?;
-    if node.protocol == "vless-ws" {
+    if is_cdn_protocol(&node.protocol) {
         if node.dns_name.trim().is_empty() {
             refuse!("CDN 中转的域名不能清空（小黄云靠它转发，客户端链接也用它拨号）");
         }
-        if !CF_HTTPS_PORTS.contains(&node.listen_port) {
+        let pool = cdn_port_pool(&node.protocol);
+        if !pool.contains(&node.listen_port) {
             refuse!(
                 "CDN 中转的端口只支持 Cloudflare 回源白名单：{}",
-                CF_HTTPS_PORTS.iter().map(|p| p.to_string()).collect::<Vec<_>>().join(" / ")
+                pool.iter().map(|p| p.to_string()).collect::<Vec<_>>().join(" / ")
             );
         }
         if !node.ws_path.trim().is_empty() && !node.ws_path.trim().starts_with('/') {
@@ -856,6 +889,25 @@ pub fn render_config_for(app: &App, bundles: &[NodeBundle], remote: bool) -> Res
                         "certificate": bundle.secret.cert_pem.lines().collect::<Vec<_>>(),
                         "key": bundle.secret.key_pem.lines().collect::<Vec<_>>(),
                     }
+                })
+            }
+            "vmess-ws" => {
+                // CDN 中转（明文 ws 回源）：CF 用 HTTP 回源到本端口，无 TLS
+                // 配置、无证书。vmess 协议层自带加密；alterId 固定 0（现代
+                // 客户端标准）。
+                serde_json::json!({
+                    "type": "vmess",
+                    "tag": tag,
+                    "listen": "::",
+                    "listen_port": n.listen_port,
+                    "users": bundle
+                        .users
+                        .iter()
+                        .map(|u| {
+                            serde_json::json!({ "name": u.name, "uuid": u.credential, "alterId": 0 })
+                        })
+                        .collect::<Vec<_>>(),
+                    "transport": { "type": "ws", "path": n.ws_path },
                 })
             }
             "hysteria2" => serde_json::json!({
@@ -1103,7 +1155,7 @@ pub fn sub_fronts(app: &App) -> Vec<Front> {
 /// 它自己的小黄云域名——Cloudflare 只在域名上代理，全局入口（IP/别的域名）
 /// 对它无意义。其余协议照用全局入口（多入口行为不变）。
 fn fronts_for(n: &ProxyNode, fronts: &[Front]) -> Result<Vec<Front>> {
-    if n.protocol == "vless-ws" {
+    if is_cdn_protocol(&n.protocol) {
         let d = n.dns_name.trim();
         if d.is_empty() {
             refuse!("CDN 节点「{}」缺少域名，无法渲染订阅", n.name);
@@ -1146,6 +1198,16 @@ pub fn share_link(bundle: &NodeBundle, user: &ProxyUser, front: &Front, label: &
                 pct(&n.ws_path),
                 name,
             ))
+        }
+        "vmess-ws" => {
+            // v2rayN 标准形态：base64(JSON)。tls 留空 = 明文 ws 回源；host
+            // 必须与小黄云域名一致，否则 CF 拒绝回源。
+            let v = serde_json::json!({
+                "v": "2", "ps": n.name, "add": host, "port": port.to_string(),
+                "id": user.credential, "aid": "0", "scy": "auto",
+                "net": "ws", "type": "none", "host": host, "path": n.ws_path, "tls": "",
+            });
+            Ok(format!("vmess://{}", STANDARD.encode(v.to_string())))
         }
         "hysteria2" => Ok(format!(
             "hysteria2://{}@{}:{}/?sni={}&insecure={}#{}",
@@ -1324,6 +1386,10 @@ pub fn clash_yaml(bundles: &[(NodeBundle, ProxyUser)], fronts: &[Front]) -> Resu
                 "    type: vless\n    uuid: {}\n    tls: true\n    servername: {}\n    network: ws\n    udp: true\n    client-fingerprint: chrome\n    ws-opts:\n      path: {}\n",
                 yv(&user.credential), yv(host), yv(&n.ws_path),
             ),
+            "vmess-ws" => format!(
+                "    type: vmess\n    uuid: {}\n    alterId: 0\n    cipher: auto\n    udp: true\n    tls: false\n    network: ws\n    ws-opts:\n      path: {}\n",
+                yv(&user.credential), yv(&n.ws_path),
+            ),
             "hysteria2" => format!(
                 "    type: hysteria2\n    password: {}\n    sni: {}\n    skip-cert-verify: {}\n    alpn: [h3]\n",
                 yv(&user.credential),
@@ -1397,6 +1463,11 @@ pub fn singbox_json(bundles: &[(NodeBundle, ProxyUser)], fronts: &[Front]) -> Re
                         "enabled": true, "server_name": server,
                         "utls": { "enabled": true, "fingerprint": "chrome" },
                     },
+                    "transport": { "type": "ws", "path": n.ws_path },
+                }),
+                "vmess-ws" => serde_json::json!({
+                    "type": "vmess", "tag": name, "server": server, "server_port": port,
+                    "uuid": user.credential, "security": "auto", "alter_id": 0,
                     "transport": { "type": "ws", "path": n.ws_path },
                 }),
                 "hysteria2" => serde_json::json!({
@@ -3729,7 +3800,7 @@ pub async fn switch_node(app: &Shared, node_id: i64, target: i64) -> Result<serd
         );
     }
     // vless-ws 的域名是小黄云记录，切换翻转必须保住 proxied 语义。
-    crate::dns::flip_proxy_node(app, &fqdn, &target_ip, node.protocol == "vless-ws").await?;
+    crate::dns::flip_proxy_node(app, &fqdn, &target_ip, is_cdn_protocol(&node.protocol)).await?;
     app.db.set_proxy_dns_target(node_id, target, &target_ip)?;
     info!("proxy node {node_id} switched to server {target}: {fqdn} -> {target_ip}");
     Ok(
@@ -4261,6 +4332,74 @@ mod tests {
             normalize_pem("-----BEGIN CERTIFICATE----- MIIabc (没有结尾)"),
             "-----BEGIN CERTIFICATE----- MIIabc (没有结尾)"
         );
+    }
+
+    /// vmess-ws（CDN 中转·明文回源）：入站 type vmess + alterId 0 + ws
+    /// transport、**无 tls 块**；链接是 v2rayN 标准 base64 JSON 且 tls 空；
+    /// 订阅拨号地址恒为自有小黄云域名（fronts_for 家族行为）。
+    #[test]
+    fn vmess_ws_node_renders_plaintext_inbound_link_and_own_domain_subscription() {
+        let node = ProxyNode {
+            server_id: 1,
+            name: "vmess测试".into(),
+            protocol: "vmess-ws".into(),
+            listen_port: 2052,
+            dns_name: "c2.example.com".into(),
+            ws_path: "/ws".into(),
+            enabled: true,
+            ..Default::default()
+        };
+        let user = ProxyUser { name: "default".into(), credential: new_uuid(), ..Default::default() };
+        // 明文回源零证书：secret 走默认 none。
+        let bundle = NodeBundle { node, secret: ProxySecret::default(), users: vec![user.clone()] };
+
+        let app = crate::App::for_test(crate::db::Db::open(":memory:").unwrap());
+        let config = render_config_for(&app, std::slice::from_ref(&bundle), false).unwrap();
+        let inbound = &config["inbounds"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|i| i["tag"] == "in-2052")
+            .expect("vmess-ws 入站应渲染");
+        assert_eq!(inbound["type"], "vmess");
+        assert_eq!(inbound["users"][0]["alterId"], 0);
+        assert_eq!(inbound["transport"]["type"], "ws");
+        assert_eq!(inbound["transport"]["path"], "/ws");
+        assert!(inbound.get("tls").is_none(), "明文回源不得出现 tls 块");
+
+        // 链接：vmess:// base64(JSON)，字段对位、tls 空。
+        let front = Front { host: "c2.example.com".into(), port: None, scheme: "https".into() };
+        let link = share_link(&bundle, &user, &front, "").unwrap();
+        assert!(link.starts_with("vmess://"), "{link}");
+        let raw = STANDARD.decode(link.trim_start_matches("vmess://")).unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&raw).unwrap();
+        assert_eq!(v["add"], "c2.example.com");
+        assert_eq!(v["port"], "2052");
+        assert_eq!(v["id"], user.credential);
+        assert_eq!(v["aid"], "0");
+        assert_eq!(v["net"], "ws");
+        assert_eq!(v["path"], "/ws");
+        assert_eq!(v["host"], "c2.example.com");
+        assert_eq!(v["tls"], "");
+        assert_eq!(v["ps"], "vmess测试");
+
+        // 订阅：多全局入口下只渲染自有域名一条、无 TLS。
+        let fronts = vec![
+            Front { host: "main.example.com".into(), port: None, scheme: "https".into() },
+            Front { host: "relay.example.com".into(), port: Some(24443), scheme: "https".into() },
+        ];
+        let json = singbox_json(&[(bundle.clone(), user.clone())], &fronts).unwrap();
+        let outbounds = json["outbounds"].as_array().unwrap();
+        assert_eq!(outbounds.len(), 1, "CDN 节点不按全局入口复制");
+        assert_eq!(outbounds[0]["server"], "c2.example.com");
+        assert_eq!(outbounds[0]["type"], "vmess");
+        assert_eq!(outbounds[0]["alter_id"], 0);
+        assert!(outbounds[0].get("tls").is_none());
+        let yaml = clash_yaml(&[(bundle, user)], &fronts).unwrap();
+        assert!(yaml.contains("type: vmess"), "{yaml}");
+        assert!(yaml.contains("tls: false"), "{yaml}");
+        assert!(yaml.contains("server: c2.example.com"), "{yaml}");
+        assert!(!yaml.contains("main.example.com"), "{yaml}");
     }
 
     #[test]
@@ -5547,6 +5686,107 @@ mod relay_render_tests {
             assert!(err.contains("已被占用"), "{err}");
             crate::dns::set_upsert_stub(None);
             crate::dns::set_origin_ca_stub(None);
+        }
+
+        /// vmess-ws 与 vless-ws 端口池分家（HTTP 族 vs HTTPS 族）：同机两
+        /// 种 CDN 节点各取各的池，vmess-ws 首选 2052 且不碰 HTTPS 池。
+        #[tokio::test]
+        async fn vmess_ws_ports_come_from_the_http_family() {
+            let _g = STUB_GUARD.lock().await;
+            let (stub, calls) = stub_upsert();
+            crate::dns::set_upsert_stub(Some(stub));
+            let shared = app_pair();
+            shared.db.set("cf_api_token", "tok").unwrap();
+            shared.db.set("cdn_base_domain", "cc.baoco.de").unwrap();
+            stub_origin_ca();
+            let machine = mk_machine(&shared, "源机", "203.0.113.5");
+
+            // vless-ws 占 HTTPS 池首位 8443。
+            let v = create_node(
+                &shared,
+                ProxyNode {
+                    name: "v线".into(),
+                    protocol: "vless-ws".into(),
+                    server_id: machine,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+            assert_eq!(shared.db.proxy_node(v).unwrap().unwrap().listen_port, 8443);
+            // vmess-ws 取 HTTP 池首位 2052，与 8443 互不干扰。
+            let m = create_node(
+                &shared,
+                ProxyNode {
+                    name: "m线".into(),
+                    protocol: "vmess-ws".into(),
+                    server_id: machine,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+            let n = shared.db.proxy_node(m).unwrap().unwrap();
+            assert_eq!(n.listen_port, 2052);
+            assert_eq!(n.dns_name, "c2.cc.baoco.de", "vless-ws 先建占了 c1");
+            // 零证书：secret 走默认。
+            let secret = shared.db.proxy_secret(m).unwrap().unwrap();
+            assert_eq!(secret.tls_mode, "none");
+            assert!(secret.cert_pem.is_empty());
+            // HTTP 端口也写 proxied 记录（黄云与端口族无关）。
+            assert_eq!(
+                *calls.lock().unwrap(),
+                vec![
+                    ("c1.cc.baoco.de".to_owned(), "203.0.113.5".to_owned(), true),
+                    ("c2.cc.baoco.de".to_owned(), "203.0.113.5".to_owned(), true),
+                ],
+                "两节点各自写黄云记录"
+            );
+            crate::dns::set_upsert_stub(None);
+            crate::dns::set_origin_ca_stub(None);
+        }
+
+        /// vmess-ws 切换主机同样保 proxied 语义（家族判定，非协议硬编码）。
+        #[tokio::test]
+        async fn vmess_ws_switch_flips_the_record_proxied() {
+            let _g = STUB_GUARD.lock().await;
+            let (stub, calls) = stub_upsert();
+            crate::dns::set_upsert_stub(Some(stub));
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let port = listener.local_addr().unwrap().port() as i64;
+            tokio::spawn(async move { while let Ok((_s, _)) = listener.accept().await {} });
+
+            let shared = app_pair();
+            shared.db.set("cf_api_token", "tok").unwrap();
+            let a = mk_machine(&shared, "源机", "127.0.0.1");
+            let b = mk_machine(&shared, "备机", "127.0.0.1");
+            let nid = shared
+                .db
+                .create_proxy_node(
+                    &ProxyNode {
+                        name: "m线".into(),
+                        protocol: "vmess-ws".into(),
+                        listen_port: port,
+                        enabled: true,
+                        server_id: a,
+                        dns_name: "c2.example.com".into(),
+                        ws_path: "/ws".into(),
+                        ..Default::default()
+                    },
+                    &ProxySecret::default(),
+                    "11111111-1111-1111-1111-111111111111",
+                )
+                .unwrap();
+            shared.db.set_proxy_dns_target(nid, a, "127.0.0.1").unwrap();
+            spawn_agent(&shared, b, false).await;
+
+            switch_node(&shared, nid, b).await.unwrap();
+            assert_eq!(
+                *calls.lock().unwrap(),
+                vec![("c2.example.com".to_owned(), "127.0.0.1".to_owned(), true)],
+                "vmess-ws 切换必须翻 proxied 记录"
+            );
+            crate::dns::set_upsert_stub(None);
         }
 
         #[tokio::test]
