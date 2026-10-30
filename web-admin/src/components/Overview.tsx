@@ -216,9 +216,7 @@ function ThroughputChart({ series, range, shift = 0 }: { series: { bucket: numbe
           <path d={areaUp} fill="url(#grad-up)" />
           <path d={lineDown} fill="none" stroke="currentColor" strokeWidth="2" className="text-primary" />
           <path d={lineUp} fill="none" stroke="currentColor" strokeWidth="1.75" className="text-up" />
-          {/* 数据点：白底描边空心圆（截图的点感来源） */}
-          {ptsDown.map((p, i) => <circle key={`d${i}`} cx={p.x} cy={p.y} r="2.5" strokeWidth="1.5" className="fill-background stroke-primary" />)}
-          {ptsUp.map((p, i) => <circle key={`u${i}`} cx={p.x} cy={p.y} r="2.5" strokeWidth="1.5" className="fill-background stroke-up" />)}
+          {/* 数据点不常显：悬停到哪个时间，那个点才出现指示环 */}
           {hoverPoint && hover !== null && (
             <>
               <line x1={x(hover)} x2={x(hover)} y1={PAD} y2={H - PAD} strokeWidth="1" className="stroke-muted-foreground/40" />
