@@ -78,16 +78,19 @@ function Kpi({ label, value, sub, accent }: { label: string; value: string; sub?
   )
 }
 
-/** 流量走势：手绘 SVG 折线双曲线 + 渐变面积（项目无图表库）。缺桶由这里补零。
- * 下行（蓝）与上行（红）在同一坐标系里各自一条连续折线（相邻桶直连，尖峰
- * 锯齿原样呈现），带渐变面积填充区分层次。真实时间刻度轴 + 十字线悬停读数。
+/** 流量走势：手绘 SVG 平滑曲线（对齐参考图）——Catmull-Rom 转三次贝塞尔
+ * 轻度平滑（控制点 1/6，峰不削顶），下行（蓝）与上行（绿）两条 + 渐变面积
+ * （减淡）；数据点空心圆点仅小点数档位显示（6h 档每分钟一点太密）。Y 轴
+ * 左侧外部 5 档均匀刻度（峰值上取整到好看的数量级），横向网格贯穿；悬停
+ * 十字线 + 白底卡片浮层（时间 / 下行 / 上行 / 合计）。缺桶由这里补零。
  * 时间窗默认 6 小时（每分钟一点），可切 24h/7d/30d。 */
 function ThroughputChart({ series, range }: { series: { bucket: number; rx: number; tx: number }[]; range: RangeKey }) {
   const { buckets, bucketSecs, tickEvery } = RANGES[range]
   const [hover, setHover] = useState<number | null>(null)
   const W = 800
   const H = 220
-  const PAD = 4
+  const PAD_L = 46 // 左侧留 Y 轴刻度文字
+  const PAD = 8
   // buckets 个整桶，缺的补零；最后一桶是"当前桶"。桶对齐 unix 时间的
   // bucketSecs 整数倍（与后端聚合一致）。
   const start = Math.floor(Date.now() / 1000 / bucketSecs) * bucketSecs - (buckets - 1) * bucketSecs
@@ -97,18 +100,43 @@ function ThroughputChart({ series, range }: { series: { bucket: number; rx: numb
     const p = byBucket.get(b)
     return { hour: i, down: p?.rx ?? 0, up: p?.tx ?? 0 }
   })
-  const max = Math.max(...points.map((p) => p.down + p.up), 1)
-  const x = (i: number) => PAD + (i * (W - PAD * 2)) / (buckets - 1)
-  const y = (v: number) => Math.max(PAD, H - PAD - (v * (H - PAD * 2)) / max)
 
-  // 直连折线：相邻桶直线相连（探针/路由器流量图风格），尖峰锯齿原样呈现。
-  const line = (key: "down" | "up") =>
-    points.map((p, i) => `${i === 0 ? "M" : "L"}${x(i).toFixed(1)},${y(p[key]).toFixed(1)}`).join(" ")
-  const lineDown = line("down")
-  const lineUp = line("up")
+  // Y 轴：堆叠峰值上取整到"好看"的数量级 → 4 等分 5 档刻度（0 到满）。
+  const rawMax = Math.max(...points.map((p) => p.down + p.up), 1)
+  const niceMax = niceCeil(rawMax)
+  const x = (i: number) => PAD_L + (i * (W - PAD_L - PAD)) / (buckets - 1)
+  const y = (v: number) => H - PAD - (v * (H - PAD * 2)) / niceMax
+  const tickVals = [0, 1, 2, 3, 4].map((i) => (niceMax / 4) * i)
+
+  // Catmull-Rom → 三次贝塞尔：控制点取相邻点差的 1/6，y 钳在绘图区内
+  // （零值邻段不向基线下方鼓包）。
+  const ptsDown = points.map((p, i) => ({ x: x(i), y: y(p.down) }))
+  const ptsUp = points.map((p, i) => ({ x: x(i), y: y(p.up) }))
+  const smooth = (pts: { x: number; y: number }[]) => {
+    if (pts.length < 2) return pts.length ? `M${pts[0].x},${pts[0].y}` : ""
+    const clampY = (v: number) => Math.min(H - PAD, Math.max(PAD, v))
+    let d = `M${pts[0].x.toFixed(1)},${pts[0].y.toFixed(1)}`
+    for (let i = 0; i < pts.length - 1; i++) {
+      const p0 = pts[Math.max(0, i - 1)]
+      const p1 = pts[i]
+      const p2 = pts[i + 1]
+      const p3 = pts[Math.min(pts.length - 1, i + 2)]
+      const c1x = p1.x + (p2.x - p0.x) / 6
+      const c1y = clampY(p1.y + (p2.y - p0.y) / 6)
+      const c2x = p2.x - (p3.x - p1.x) / 6
+      const c2y = clampY(p2.y - (p3.y - p1.y) / 6)
+      d += ` C${c1x.toFixed(1)},${c1y.toFixed(1)} ${c2x.toFixed(1)},${c2y.toFixed(1)} ${p2.x.toFixed(1)},${p2.y.toFixed(1)}`
+    }
+    return d
+  }
+  const lineDown = smooth(ptsDown)
+  const lineUp = smooth(ptsUp)
   const baseline = H - PAD
   const areaDown = `${lineDown} L${x(buckets - 1).toFixed(1)},${baseline} L${x(0).toFixed(1)},${baseline} Z`
   const areaUp = `${lineUp} L${x(buckets - 1).toFixed(1)},${baseline} L${x(0).toFixed(1)},${baseline} Z`
+
+  // 数据点圆点：小点数档位（24h/7d/30d）逐点空心圆；6h 档每分钟一点太密。
+  const showDots = buckets <= 60
 
   // 刻度：每 tickEvery 桶一个 + 末桶「现在」。24h 档零点刻度带日期。
   const pad2 = (n: number) => String(n).padStart(2, "0")
@@ -139,7 +167,7 @@ function ThroughputChart({ series, range }: { series: { bucket: number; rx: numb
   const onMove = (e: ReactMouseEvent<SVGSVGElement>) => {
     const rect = e.currentTarget.getBoundingClientRect()
     const relX = ((e.clientX - rect.left) / rect.width) * W
-    const idx = Math.round((relX - PAD) / ((W - PAD * 2) / (buckets - 1)))
+    const idx = Math.round((relX - PAD_L) / ((W - PAD_L - PAD) / (buckets - 1)))
     setHover(Math.max(0, Math.min(buckets - 1, idx)))
   }
   // tooltip 水平位置三段翻转，贴边不出界。
@@ -149,27 +177,35 @@ function ThroughputChart({ series, range }: { series: { bucket: number; rx: numb
   return (
     <div className="flex flex-col gap-2">
       <div className="relative">
-        <svg viewBox={`0 0 ${W} ${H}`} className="w-full" role="img" aria-label="流量折线图，悬停查看各时点数值" onMouseMove={onMove} onMouseLeave={() => setHover(null)}>
-          {tickIdx.slice(0, -1).map((i) => (
-            <line key={i} x1={x(i)} x2={x(i)} y1={PAD} y2={H - PAD} strokeWidth="1" className="stroke-muted-foreground/15" />
+        <svg viewBox={`0 0 ${W} ${H}`} className="w-full" role="img" aria-label="流量平滑曲线图，悬停查看各时点数值" onMouseMove={onMove} onMouseLeave={() => setHover(null)}>
+          {/* Y 轴刻度：左侧外部文字 + 横向网格贯穿（基线 0 为实线） */}
+          {tickVals.map((t) => (
+            <g key={t}>
+              <line
+                x1={PAD_L}
+                x2={W - PAD}
+                y1={y(t)}
+                y2={y(t)}
+                strokeWidth="1"
+                strokeDasharray={t === 0 ? undefined : "3 4"}
+                className={t === 0 ? "stroke-muted-foreground/30" : "stroke-muted-foreground/15"}
+              />
+              <text x={PAD_L - 6} y={y(t) + 3} fontSize="9" textAnchor="end" className="fill-muted-foreground/70">
+                {bytes(t)}
+              </text>
+            </g>
           ))}
-          {/* 横向虚线刻度（按峰值比例）+ 右侧流量值：给「当前量级」一个参照物 */}
-          {/* y 轴自解释：顶部峰值虚线、中线虚线、底部 0 基线实线，左侧标数值 */}
-          <line x1={PAD} x2={W - PAD} y1={PAD} y2={PAD} strokeDasharray="3 4" strokeWidth="1" className="stroke-muted-foreground/25" />
-          <line x1={PAD} x2={W - PAD} y1={y(max / 2)} y2={y(max / 2)} strokeDasharray="3 4" strokeWidth="1" className="stroke-muted-foreground/25" />
-          <line x1={PAD} x2={W - PAD} y1={H - PAD} y2={H - PAD} strokeWidth="1" className="stroke-muted-foreground/30" />
-          <text x={PAD + 4} y={PAD + 10} fontSize="9" className="fill-muted-foreground/60">{bytes(max)}</text>
-          <text x={PAD + 4} y={y(max / 2) - 4} fontSize="9" className="fill-muted-foreground/60">{bytes(max / 2)}</text>
-          <text x={PAD + 4} y={H - PAD - 4} fontSize="9" className="fill-muted-foreground/60">0</text>
-          {/* 折线 + 渐变面积（最早的形态）：时间窗收窄后每分钟一点有足够
-              横向空间，折线舒展可读 */}
+          {/* 纵向网格线（X 轴刻度位） */}
+          {tickIdx.map((i) => (
+            <line key={i} x1={x(i)} x2={x(i)} y1={PAD} y2={H - PAD} strokeWidth="1" className="stroke-muted-foreground/10" />
+          ))}
           <defs>
             <linearGradient id="grad-down" x1="0" y1="0" x2="0" y2="1">
-              <stop offset="0%" stopColor="currentColor" stopOpacity="0.28" className="text-primary" />
+              <stop offset="0%" stopColor="currentColor" stopOpacity="0.14" className="text-primary" />
               <stop offset="100%" stopColor="currentColor" stopOpacity="0.02" className="text-primary" />
             </linearGradient>
             <linearGradient id="grad-up" x1="0" y1="0" x2="0" y2="1">
-              <stop offset="0%" stopColor="currentColor" stopOpacity="0.24" className="text-up" />
+              <stop offset="0%" stopColor="currentColor" stopOpacity="0.12" className="text-up" />
               <stop offset="100%" stopColor="currentColor" stopOpacity="0.02" className="text-up" />
             </linearGradient>
           </defs>
@@ -177,38 +213,49 @@ function ThroughputChart({ series, range }: { series: { bucket: number; rx: numb
           <path d={areaUp} fill="url(#grad-up)" />
           <path d={lineDown} fill="none" stroke="currentColor" strokeWidth="2" className="text-primary" />
           <path d={lineUp} fill="none" stroke="currentColor" strokeWidth="1.75" className="text-up" />
+          {/* 数据点：白底描边空心圆（截图的点感来源） */}
+          {showDots &&
+            ptsDown.map((p, i) => <circle key={`d${i}`} cx={p.x} cy={p.y} r="2.5" strokeWidth="1.5" className="fill-background stroke-primary" />)}
+          {showDots &&
+            ptsUp.map((p, i) => <circle key={`u${i}`} cx={p.x} cy={p.y} r="2.5" strokeWidth="1.5" className="fill-background stroke-up" />)}
           {hoverPoint && hover !== null && (
             <>
               <line x1={x(hover)} x2={x(hover)} y1={PAD} y2={H - PAD} strokeWidth="1" className="stroke-muted-foreground/40" />
-              <circle cx={x(hover)} cy={y(hoverPoint.down)} r="3.5" className="fill-primary" />
-              <circle cx={x(hover)} cy={y(hoverPoint.up)} r="3.5" className="fill-up" />
+              <circle cx={x(hover)} cy={y(hoverPoint.down)} r="4" strokeWidth="2" className="fill-background stroke-primary" />
+              <circle cx={x(hover)} cy={y(hoverPoint.up)} r="4" strokeWidth="2" className="fill-background stroke-up" />
             </>
           )}
         </svg>
         {hoverPoint && hover !== null && (
           <div
-            className="pointer-events-none absolute top-1 z-10 w-max rounded-md border bg-popover px-2.5 py-1.5 text-xs shadow-md"
+            className="pointer-events-none absolute top-1 z-10 w-max rounded-lg border bg-popover px-3 py-2 text-xs shadow-md"
             style={{ left: `${(x(hover) / W) * 100}%`, transform: tipAlign }}
           >
-            <div className="font-medium">{hoverTime(hover)}</div>
-            <div className="mt-0.5 flex flex-col gap-0.5 text-muted-foreground">
-              <span>下行 {bytes(hoverPoint.down)}</span>
-              <span>上行 {bytes(hoverPoint.up)}</span>
+            <div className="font-medium">时间：{hoverTime(hover)}</div>
+            <div className="mt-1 flex flex-col gap-0.5">
+              <span className="flex items-center gap-1.5 text-muted-foreground">
+                <i className="size-2 rounded-full bg-primary" />
+                下行 <span className="font-medium text-foreground">{bytes(hoverPoint.down)}</span>
+              </span>
+              <span className="flex items-center gap-1.5 text-muted-foreground">
+                <i className="size-2 rounded-full bg-up" />
+                上行 <span className="font-medium text-foreground">{bytes(hoverPoint.up)}</span>
+              </span>
               <span className="font-medium text-foreground">合计 {bytes(hoverPoint.down + hoverPoint.up)}</span>
             </div>
           </div>
         )}
       </div>
-      {/* 刻度行：百分比定位与网格线对齐；首尾刻度向内对齐防溢出。 */}
+      {/* X 轴刻度行：每 tickEvery 桶一个（对齐参考图的整点标注），首尾
+          向内对齐、居中刻度居中对齐防溢出。 */}
       <div className="relative h-4 text-xs text-muted-foreground">
-        {/* 只留首尾两个刻度（对齐参考图 22:52 / 23:22 的极简） */}
-        {[0, buckets - 1].map((i) => (
+        {tickIdx.map((i) => (
           <span
             key={i}
             className="absolute top-0 whitespace-nowrap"
             style={{
               left: `${(x(i) / W) * 100}%`,
-              transform: i === 0 ? "translateX(0)" : "translateX(-100%)",
+              transform: i === 0 ? "translateX(0)" : i === buckets - 1 ? "translateX(-100%)" : "translateX(-50%)",
             }}
           >
             {i === buckets - 1 ? "现在" : fmtTick(i)}
@@ -217,6 +264,16 @@ function ThroughputChart({ series, range }: { series: { bucket: number; rx: numb
       </div>
     </div>
   )
+}
+
+/** 峰值上取整到"好看"的数量级（刻度档列表内最近的上界）：2.2G → 2.5G、
+ * 5.5e8 → 6e8 等，保证 Y 轴刻度标签干净可读。 */
+function niceCeil(v: number): number {
+  const exp = Math.floor(Math.log10(v))
+  const base = Math.pow(10, exp)
+  const m = v / base
+  const steps = [1, 1.5, 2, 2.5, 3, 4, 5, 6, 8, 10]
+  return (steps.find((s) => s >= m - 1e-9) ?? 10) * base
 }
 
 /** 堆叠双色排行条（截图同款）：名称 + 总量大字、下行蓝/上行橙堆叠条、
