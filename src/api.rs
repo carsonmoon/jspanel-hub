@@ -3464,6 +3464,9 @@ pub(crate) fn tag_bundle<'a>(
                 crate::proxy::node_server_ids(&b.node).contains(&server_id) && b.node.listen_port == port
             })
         })
+        // 冷路径兜底：server_id=0 是纯 hub 部署（本机无节点行）的采样身份，
+        // 以及身份统一（v56）前/重写冲突下残留的历史行。agent 形态下正常
+        // 不再产生 0 行。
         .or_else(|| {
             bundles.iter().find(|b| b.node.listen_port == port && (server_id == 0 || b.node.server_id == 0))
         })

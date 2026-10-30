@@ -2927,9 +2927,14 @@ pub async fn stats_loop(app: crate::Shared) {
     let mut last_snapshot = 0i64;
     loop {
         tokio::time::sleep(Duration::from_secs(5)).await;
+        // 本机记账身份：本机是 agent 节点（hub+agent 同机）时记到该节点
+        // 行名下——哨兵 0 在身份归一后匹配不到任何节点，曾让 hub 节点的
+        // 订阅/凭据配额记账与超额摘除静默断流（迁移 47 起的潜伏 bug）。
+        // 纯 hub 部署（本机无节点行）回落 0，读取侧按端口兜底。
+        let local_sid = local_node_server_id(&app).unwrap_or(0);
         let deltas = drain_api_deltas();
         if !deltas.is_empty() {
-            book_sub_usage(&app, 0, &deltas);
+            book_sub_usage(&app, local_sid, &deltas);
         }
         // 长连接快照（M14）：每 60s 把仍活跃的连接明细 upsert 进缓冲，
         // 保证日志页能看到尚未关闭的连接。
@@ -2968,7 +2973,7 @@ pub async fn stats_loop(app: crate::Shared) {
                     }
                 })
                 .collect();
-            if let Err(e) = app.db.upsert_connection_logs(0, &rows) {
+            if let Err(e) = app.db.upsert_connection_logs(local_sid, &rows) {
                 warn!("connection logs 落库失败: {e:#}");
             }
         }
@@ -2978,7 +2983,7 @@ pub async fn stats_loop(app: crate::Shared) {
         if !tag_deltas.is_empty() {
             let ts = chrono::Utc::now().timestamp();
             let rows: Vec<(i64, &str, i64, i64, i64)> =
-                tag_deltas.iter().map(|(tag, (rx, tx))| (0, tag.as_str(), ts, *rx, *tx)).collect();
+                tag_deltas.iter().map(|(tag, (rx, tx))| (local_sid, tag.as_str(), ts, *rx, *tx)).collect();
             if let Err(e) = app.db.add_traffic_samples(&rows) {
                 warn!("traffic booking failed: {e:#}");
             }
@@ -3134,9 +3139,11 @@ fn reset_conn_state() {
     users_of_conn().lock().unwrap_or_else(|e| e.into_inner()).clear();
 }
 
-/// 把一批用户增量记到客户头上（user 字段即凭据用户名 → proxy_user →
-/// sub_user）；刚越过配额的客户即时通知并推向摘除后的期望配置。没有客户
-/// 的用户名（未认领的独立凭据）没有配额可言，静默跳过。
+/// 把一批用户增量记到账上（user 字段即凭据用户名 → proxy_user →
+/// sub_user）：客户级记到 sub_user，刚越过配额的即时通知并推向摘除后的
+/// 期望配置；凭据级（方向 40）记到 proxy_user——凭据可以不绑客户而单独
+/// 设配额，所以两段记账互相独立，都按各自命中的行执行，不能因一段为空
+/// 提前返回（曾致「设了配额但未绑订阅」的凭据永不记账）。
 fn book_sub_usage(app: &App, server_id: i64, per_user: &HashMap<String, (i64, i64)>) {
     if per_user.is_empty() {
         return;
@@ -3152,10 +3159,14 @@ fn book_sub_usage(app: &App, server_id: i64, per_user: &HashMap<String, (i64, i6
             })
         })
         .collect();
-    if deltas.is_empty() {
-        return;
+    if !deltas.is_empty() {
+        book_sub_level_usage(app, &deltas);
     }
-    match app.db.bump_sub_usage(&deltas) {
+    book_credential_level_usage(app, server_id, per_user);
+}
+
+fn book_sub_level_usage(app: &App, deltas: &[(i64, i64, i64)]) {
+    match app.db.bump_sub_usage(deltas) {
         Ok(crossed) if !crossed.is_empty() => {
             crate::notify::sub_over_quota(app, &crossed);
             for id in crossed {
@@ -3167,8 +3178,12 @@ fn book_sub_usage(app: &App, server_id: i64, per_user: &HashMap<String, (i64, i6
         Ok(_) => {}
         Err(e) => warn!("sub usage booking failed: {e:#}"),
     }
-    // 凭据级配额（方向 40）：同一批增量同步记到 proxy_user 行上，越过凭据
-    // 自身配额的即时推向该凭据所在服务器的摘除后配置。
+}
+
+/// 凭据级配额（方向 40）：同一批增量同步记到 proxy_user 行上，越过凭据
+/// 自身配额的即时推向该凭据所在服务器的摘除后配置。不限量凭据（quota=0）
+/// 由 bump 内部跳过，无需在此过滤。
+fn book_credential_level_usage(app: &App, server_id: i64, per_user: &HashMap<String, (i64, i64)>) {
     let pu_names: Vec<String> = per_user.keys().cloned().collect();
     if let Ok(pu_map) = app.db.proxy_user_ids_of_names(server_id, &pu_names) {
         let pu_deltas: Vec<(i64, i64, i64)> = pu_map
@@ -4304,6 +4319,42 @@ mod tests {
         assert!(yaml.contains("server: c1.example.com"), "{yaml}");
         assert!(yaml.contains("path: /ws"), "{yaml}");
         assert!(!yaml.contains("main.example.com"), "{yaml}");
+    }
+
+    /// 凭据级记账独立于订阅绑定：「设了配额但未绑订阅」的凭据必须记账
+    /// （曾因 book_sub_usage 的提前返回永不记账，hub 节点又叠加 0 身份
+    /// 彻底断流）。
+    #[test]
+    fn credential_level_usage_books_without_a_subscription() {
+        let app = crate::App::for_test(crate::db::Db::open(":memory:").unwrap());
+        let machine =
+            app.db.create_node(&crate::db::Node { name: "hub".into(), ..Default::default() }, "tok").unwrap();
+        let node = ProxyNode {
+            name: "89".into(),
+            protocol: "vless-reality".into(),
+            listen_port: 26615,
+            server_id: machine,
+            ..Default::default()
+        };
+        let secret = ProxySecret {
+            tls_mode: "reality".into(),
+            private_key: "k".into(),
+            public_key: "p".into(),
+            short_id: "s".into(),
+            ..Default::default()
+        };
+        let nid = app.db.create_proxy_node(&node, &secret, "uuid-1").unwrap();
+        // default 凭据：设 5MB 配额，不绑订阅。
+        let users =
+            app.db.proxy_node_bundles().unwrap().into_iter().find(|b| b.node.id == nid).unwrap().users;
+        let uid = users[0].id;
+        app.db.set_proxy_user_limits(uid, None, 5_000_000, "monthly").unwrap();
+
+        book_credential_level_usage(&app, machine, &HashMap::from([("default".to_owned(), (0, 1_500_000))]));
+        let used = app.db.proxy_node_bundles().unwrap().into_iter().find(|b| b.node.id == nid).unwrap().users
+            [0]
+        .quota_used_down;
+        assert_eq!(used, 1_500_000, "凭据级配额必须记账");
     }
 
     /// 粘贴损坏的 PEM（换行丢成空格/整段一行）自动修复：「刺激」「888」

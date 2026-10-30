@@ -14,6 +14,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tracing::info;
 
+#[derive(Default)]
 pub struct ConnLogFilter {
     pub server_id: Option<i64>,
     /// 来源筛选：None=全部，Some("__none__")=未认领（自用），Some(名字)=该客户。
@@ -360,7 +361,7 @@ CREATE TABLE IF NOT EXISTS session (
 /// 模式，template_name 可为空）。
 /// Bumped to 28（第二次使用）for 订阅文件节点勾选：sub_profiles 加
 /// selected_nodes（勾选的节点 id 数组，非空 = 只包含这些节点）。
-const SCHEMA_VERSION: i64 = 55;
+const SCHEMA_VERSION: i64 = 56;
 
 /// Adds a column older databases lack. A duplicate column indicates the
 /// migration has already run; every other error must propagate.
@@ -1328,6 +1329,41 @@ fn migrate_to_54(conn: &Connection) -> Result<()> {
     add_column(conn, "proxy_node", "ws_path TEXT NOT NULL DEFAULT ''")
 }
 
+/// 本机采样身份统一（0 → 本机节点行）：hub+agent 同机部署下，本机的
+/// 流量采样/连接日志/配额记账曾以哨兵 0 记账，而节点表身份归一后 0 匹配
+/// 不到任何节点——hub 节点的配额记账与超额摘除自迁移 47 起静默断流。
+/// 历史 0 行在此重写为本机节点 id（stats_loop 此后直接盖本机 id）；
+/// 纯 hub 部署（本机无节点行）无从重写，保留 0 由读取侧按端口兜底。
+/// 备份恢复到另一台机器时迁移重跑，0 行重写为新机器的本机 id，语义正确。
+fn migrate_to_56(conn: &Connection) -> Result<()> {
+    let local_id = local_sampling_identity(conn);
+    let Some(local_id) = local_id else { return Ok(()) };
+    unify_local_sampling_rows(conn, local_id)
+}
+
+/// 本机采样身份的解析：hostname 匹配 node 表的行。任何一步不可得
+/// （纯 hub / 老库缺列 / 无 hostname）返回 None，调用方跳过重写。
+fn local_sampling_identity(conn: &Connection) -> Option<i64> {
+    let hub_host = std::fs::read_to_string("/etc/hostname").ok()?.trim().to_owned();
+    if hub_host.is_empty() || !schema_mentions(conn, "node", "CREATE TABLE").ok()? {
+        return None;
+    }
+    // 列缺失/表缺失等一切错误都按「无本机身份」处理：迁移尽力而为。
+    conn.query_row("SELECT id FROM node WHERE hostname = ?1", [&hub_host], |r| r.get(0)).ok()
+}
+
+fn unify_local_sampling_rows(conn: &Connection, local_id: i64) -> Result<()> {
+    if schema_mentions(conn, "traffic_samples", "CREATE TABLE")? {
+        conn.execute("UPDATE traffic_samples SET server_id = ?1 WHERE server_id = 0", [local_id])?;
+    }
+    // connection_log 主键含 server_id：目标键已存在（恢复的备份/长连接跨
+    // 部署）时 OR IGNORE 保留 0 行走读取兜底，而不是迁移失败。
+    if schema_mentions(conn, "connection_log", "CREATE TABLE")? {
+        conn.execute("UPDATE OR IGNORE connection_log SET server_id = ?1 WHERE server_id = 0", [local_id])?;
+    }
+    Ok(())
+}
+
 /// 删除节点的级联清理从未生效：hub 连接没开 PRAGMA foreign_keys（迁移
 /// 事务里的开关只盖迁移自身），proxy_node 行删掉后 secret（含私钥/证书）
 /// 与凭据永远残留。历史孤儿在此清一次，此后 delete_proxy_node 显式带走。
@@ -1638,6 +1674,9 @@ fn migrate_inner(conn: &Connection, from: i64) -> Result<()> {
     }
     if from < 55 {
         migrate_to_55(&tx)?;
+    }
+    if from < 56 {
+        migrate_to_56(&tx)?;
     }
     let fk_after = fk_violation_rows(conn)?;
     if fk_after.len() > fk_before.len() {
@@ -3557,8 +3596,11 @@ impl Db {
              WHERE n.server_id = ?1 AND u.name = ?2",
         )?;
         for name in names {
+            // 列序：SELECT u.name, u.id——id 在第 1 列。曾错读第 0 列（TEXT
+            // 的 name 当 i64）类型错误被 if let Ok 静默吞掉，pu_map 恒空、
+            // 凭据级配额记账自写下起从未工作（mcp 列序错同款病）。
             if let Ok(Some(pu_id)) =
-                stmt.query_row(params![server_id, name], |r| r.get::<_, i64>(0)).optional()
+                stmt.query_row(params![server_id, name], |r| r.get::<_, i64>(1)).optional()
             {
                 out.push((name.clone(), pu_id));
             }
@@ -7848,6 +7890,65 @@ mod tests {
         let bundles = db.proxy_node_bundles().unwrap();
         assert!(bundles.iter().all(|b| b.node.id != id), "节点已删");
         assert!(bundles.iter().any(|b| b.node.id == keep && !b.users.is_empty()), "幸存节点凭据完好");
+    }
+
+    /// 凭据名 → proxy_user.id 映射（配额记账的定位查询）：曾错读列序
+    /// （name 当 id）类型错误被静默吞掉，pu_map 恒空。
+    #[test]
+    fn proxy_user_ids_of_names_maps_credential_names_to_rows() {
+        let db = db();
+        let node = ProxyNode {
+            name: "hk".into(),
+            protocol: "vless-reality".into(),
+            listen_port: 24005,
+            server_id: 3,
+            ..Default::default()
+        };
+        let id = db.create_proxy_node(&node, &ProxySecret::default(), "cred").unwrap();
+        let out = db.proxy_user_ids_of_names(3, &["default".to_owned(), "不存在".to_owned()]).unwrap();
+        assert_eq!(out.len(), 1, "命中的凭据返回、未命中的跳过");
+        assert_eq!(out[0].0, "default");
+        assert!(out[0].1 > 0, "id 列真实读出（列序 bug 则恒空）");
+        let _ = id;
+    }
+
+    /// 本机采样身份统一（v56）：0 身份的历史采样/连接日志重写到本机节点
+    /// 行名下——配额记账曾因 0 匹配不到节点而静默断流。
+    #[test]
+    fn local_sampling_rows_unify_under_the_hub_identity() {
+        let db = db();
+        let ts = Utc::now().timestamp();
+        db.add_traffic_samples(&[(0, "in-24001", ts, 10, 20), (5, "in-24002", ts, 1, 2)]).unwrap();
+        db.upsert_connection_logs(
+            0,
+            &[ConnectionLogRow {
+                conn_id: "c1".into(),
+                user: "alice".into(),
+                inbound: "in-24001".into(),
+                network: "tcp".into(),
+                source: "1.2.3.4:5".into(),
+                host: "example.com".into(),
+                port: 443,
+                first: ts,
+                last: ts,
+                up: 1,
+                down: 2,
+            }],
+        )
+        .unwrap();
+
+        unify_local_sampling_rows(&db.conn(), 7).unwrap();
+        // 0 行全部归到 7；别的机器行不动。
+        let traffic = db.proxy_traffic().unwrap();
+        assert!(traffic.iter().any(|(sid, tag, ..)| *sid == 7 && tag == "in-24001"), "{traffic:?}");
+        assert!(!traffic.iter().any(|(sid, ..)| *sid == 0), "0 身份应清零: {traffic:?}");
+        assert!(traffic.iter().any(|(sid, tag, ..)| *sid == 5 && tag == "in-24002"), "{traffic:?}");
+        let (rows, _) =
+            db.connection_logs(&ConnLogFilter { server_id: Some(7), ..Default::default() }).unwrap();
+        assert_eq!(rows.len(), 1, "连接日志随身份归到 7");
+        // 幂等：再跑一遍无事发生。
+        unify_local_sampling_rows(&db.conn(), 7).unwrap();
+        assert_eq!(db.proxy_traffic().unwrap().len(), 2);
     }
 
     /// 改端口（或挪服务器）必须带着历史走：采样与连接日志以
