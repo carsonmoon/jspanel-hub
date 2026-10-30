@@ -3653,16 +3653,20 @@ pub async fn proxy_overview(_: Admin, State(app): State<Shared>, Query(q): Query
     // range → 统计窗口与桶粒度：6h 分钟桶、24h 小时桶（对齐参考图：一小时
     // 一点、逐小时标注）、7d/10 分钟桶、30d/小时桶，未知值回退 24h。
     let (since, bucket) = match q.range.as_deref() {
-        Some("6h") => (now - 6 * 3_600, 60),
-        Some("7d") => (now - 7 * 86_400, 600),
-        Some("30d") => (now - 30 * 86_400, 3600),
+        Some("6h") => (now - 6 * 3_600, 300),
+        Some("7d") => (now - 7 * 86_400, 7_200),
+        Some("30d") => (now - 30 * 86_400, 86_400),
         _ => (now - 86_400, 3_600),
     };
 
     match (|| -> anyhow::Result<serde_json::Value> {
+        // 日桶（30d）对齐本地零点：shift 取服务器时区偏移，随响应发给前端
+        // （前端窗口对齐要用同一偏移）；小时/分钟桶天然对齐，shift=0。
+        let series_shift =
+            if bucket >= 86_400 { i64::from(Local::now().offset().local_minus_utc()) } else { 0 };
         let series: Vec<Value> = app
             .db
-            .traffic_series(since, bucket)?
+            .traffic_series(since, bucket, series_shift)?
             .into_iter()
             .map(|(bucket, rx, tx)| json!({ "bucket": bucket, "rx": rx, "tx": tx }))
             .collect();
@@ -3694,7 +3698,7 @@ pub async fn proxy_overview(_: Admin, State(app): State<Shared>, Query(q): Query
         let midnight = today_start.map(|t| t.timestamp()).unwrap_or(now - 86_400);
         let today_series: Vec<Value> = app
             .db
-            .traffic_series(midnight, 3600)?
+            .traffic_series(midnight, 3600, 0)?
             .into_iter()
             .map(|(bucket, rx, tx)| json!({ "bucket": bucket, "rx": rx, "tx": tx }))
             .collect();
@@ -3842,6 +3846,7 @@ pub async fn proxy_overview(_: Admin, State(app): State<Shared>, Query(q): Query
 
         Ok(json!({
             "series": series,
+            "series_shift": series_shift,
             "node_rank": node_rank,
             "customer_rank": customer_rank,
             "quota_warn": quota_warn,

@@ -3655,13 +3655,16 @@ impl Db {
     /// 全网流量按桶聚合（概览走势图）：桶内 SUM 即该桶字节，缺桶（无流量时段）
     /// 由前端补零。桶对齐 unix 时间的 bucket_secs 整数倍（24h/小时桶、7d/6h 桶、
     /// 30d/天桶）。
-    pub fn traffic_series(&self, since: i64, bucket_secs: i64) -> Result<Vec<(i64, i64, i64)>> {
+    /// shift：桶对齐的时区偏移秒数（日桶对齐本地零点用；小时/分钟桶在
+    /// 东八区天然对齐，传 0）。返回的桶键已减回 shift，仍是真实 unix 秒。
+    pub fn traffic_series(&self, since: i64, bucket_secs: i64, shift: i64) -> Result<Vec<(i64, i64, i64)>> {
         let conn = self.conn();
         let mut stmt = conn.prepare(
-            "SELECT (ts/?2)*?2, COALESCE(SUM(rx),0), COALESCE(SUM(tx),0)
-             FROM traffic_samples WHERE ts >= ?1 GROUP BY ts/?2 ORDER BY ts/?2",
+            "SELECT ((ts + ?3)/?2)*?2 - ?3, COALESCE(SUM(rx),0), COALESCE(SUM(tx),0)
+             FROM traffic_samples WHERE ts >= ?1 GROUP BY (ts + ?3)/?2 ORDER BY (ts + ?3)/?2",
         )?;
-        let rows = stmt.query_map(params![since, bucket_secs], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+        let rows =
+            stmt.query_map(params![since, bucket_secs, shift], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
         Ok(rows.collect::<Result<_, _>>()?)
     }
 
@@ -7083,10 +7086,10 @@ mod tests {
         ])
         .unwrap();
 
-        let hourly = db.traffic_series(base, 3600).unwrap();
+        let hourly = db.traffic_series(base, 3600, 0).unwrap();
         assert_eq!(hourly, vec![(base, 150, 15), (base + 3600, 7, 1)]);
 
-        let six_hourly = db.traffic_series(base, 6 * 3600).unwrap();
+        let six_hourly = db.traffic_series(base, 6 * 3600, 0).unwrap();
         assert_eq!(six_hourly, vec![(base, 157, 16)]);
     }
 
@@ -8037,7 +8040,7 @@ mod tests {
             db.proxy_traffic().unwrap().iter().fold((0, 0), |a, t| (a.0 + t.4, a.1 + t.5));
         assert_eq!(total_after, total_before, "compaction must not move a byte");
 
-        let old_hour_rows: Vec<_> = db.traffic_series(old - 3600, 3600).unwrap().into_iter().collect();
+        let old_hour_rows: Vec<_> = db.traffic_series(old - 3600, 3600, 0).unwrap().into_iter().collect();
         assert!(
             old_hour_rows.contains(&(base - 9 * 86_400, 150, 15)),
             "two samples folded into one hour row"
@@ -8051,7 +8054,7 @@ mod tests {
         assert_eq!(total_again, total_before);
 
         // 新采样未被触碰。
-        let fresh_rows = db.traffic_series(fresh - 3600, 3600).unwrap();
+        let fresh_rows = db.traffic_series(fresh - 3600, 3600, 0).unwrap();
         assert!(fresh_rows.iter().any(|(_, rx, tx)| *rx == 500 && *tx == 50));
     }
 

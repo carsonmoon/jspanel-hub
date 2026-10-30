@@ -13,6 +13,7 @@ import { bytes } from "@/lib/format"
 
 type Overview = {
   series: { bucket: number; rx: number; tx: number }[]
+  series_shift?: number
   node_rank: { node: string; rx: number; tx: number }[]
   customer_rank: { name: string; up: number; down: number; quota_bytes: number; status: string }[]
   quota_warn: { name: string; used: number; quota_bytes: number; status: string }[]
@@ -33,11 +34,13 @@ type Overview = {
 // 走势范围 → 桶数与桶粒度（与后端 proxy_overview 的 range 映射逐档相等）。
 // tickEvery：刻度间隔（桶数），末桶固定加「现在」刻度。30d 档 1h 是精度
 // 上限：8 天前的采样已压缩成小时行，更细的桶会失真。
+// 桶数目标 24~84（走势可读、圆点/标注可控），标注 6~24 个；30d 日桶的
+// 精度下限由采样压缩（8 天前起小时行）决定，日粒度恰为小时行聚合。
 const RANGES = {
-  "6h": { label: "6小时", buckets: 360, bucketSecs: 60, tickEvery: 60 },
+  "6h": { label: "6小时", buckets: 72, bucketSecs: 5 * 60, tickEvery: 12 },
   "24h": { label: "24小时", buckets: 24, bucketSecs: 3600, tickEvery: 1 },
-  "7d": { label: "7天", buckets: 1008, bucketSecs: 10 * 60, tickEvery: 144 },
-  "30d": { label: "30天", buckets: 720, bucketSecs: 3600, tickEvery: 120 },
+  "7d": { label: "7天", buckets: 84, bucketSecs: 2 * 3600, tickEvery: 24 },
+  "30d": { label: "30天", buckets: 30, bucketSecs: 86400, tickEvery: 2 },
 } as const
 type RangeKey = keyof typeof RANGES
 
@@ -84,7 +87,7 @@ function Kpi({ label, value, sub, accent }: { label: string; value: string; sub?
  * 左侧外部 5 档均匀刻度（峰值上取整到好看的数量级），横向网格贯穿；悬停
  * 十字线 + 白底卡片浮层（时间 / 下行 / 上行 / 合计）。缺桶由这里补零。
  * 时间窗默认 6 小时（每分钟一点），可切 24h/7d/30d。 */
-function ThroughputChart({ series, range }: { series: { bucket: number; rx: number; tx: number }[]; range: RangeKey }) {
+function ThroughputChart({ series, range, shift = 0 }: { series: { bucket: number; rx: number; tx: number }[]; range: RangeKey; shift?: number }) {
   const { buckets, bucketSecs, tickEvery } = RANGES[range]
   const [hover, setHover] = useState<number | null>(null)
   const W = 800
@@ -93,7 +96,9 @@ function ThroughputChart({ series, range }: { series: { bucket: number; rx: numb
   const PAD = 8
   // buckets 个整桶，缺的补零；最后一桶是"当前桶"。桶对齐 unix 时间的
   // bucketSecs 整数倍（与后端聚合一致）。
-  const start = Math.floor(Date.now() / 1000 / bucketSecs) * bucketSecs - (buckets - 1) * bucketSecs
+  // 桶对齐含时区偏移（30d 日桶对齐本地零点；其余偏移为 0），与后端一致。
+  const start =
+    Math.floor((Date.now() / 1000 + shift) / bucketSecs) * bucketSecs - shift - (buckets - 1) * bucketSecs
   const byBucket = new Map(series.map((p) => [p.bucket, p]))
   const points = Array.from({ length: buckets }, (_, i) => {
     const b = start + i * bucketSecs
@@ -146,12 +151,10 @@ function ThroughputChart({ series, range }: { series: { bucket: number; rx: numb
   }
   const fmtTick = (i: number) => {
     const b = start + i * bucketSecs
-    if (range === "30d") return fmtDate(b)
-    if (range === "7d") {
-      const d = new Date(b * 1000)
-      return `${fmtDate(b)} ${pad2(d.getHours())}:00`
-    }
     const d = new Date(b * 1000)
+    if (range === "30d") return fmtDate(b)
+    if (range === "7d") return `${fmtDate(b)} ${pad2(d.getHours())}:00`
+    if (bucketSecs < 3600) return `${pad2(d.getHours())}:${pad2(d.getMinutes())}`
     return d.getHours() === 0 ? fmtDate(b) : `${pad2(d.getHours())}:00`
   }
   const tickIdx: number[] = []
@@ -532,7 +535,7 @@ export default function Overview({ go }: { go?: (to: string) => void }) {
             </div>
           </div>
         </div>
-        <ThroughputChart series={data.series} range={loadedRange} />
+        <ThroughputChart series={data.series} range={loadedRange} shift={data.series_shift ?? 0} />
       </Card>
 
 
