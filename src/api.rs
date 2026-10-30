@@ -2359,7 +2359,13 @@ pub async fn delete_proxy_node(_: Admin, State(app): State<Shared>, Path(id): Pa
         .filter(|n| proxy::is_cdn_protocol(&n.protocol) && !n.dns_name.trim().is_empty())
         .map(|n| n.dns_name.trim().to_owned());
     let server_id = app.db.proxy_node(id).ok().flatten().map(|n| n.server_id);
-    match app.db.delete_proxy_node(id) {
+    // 被删节点涉本机渲染（家在 hub 或镜像到 hub）时，其 hub 本机采样以
+    // server_id=0 记账，删除清理须一并扫掉（见 db.delete_proxy_node）。
+    let extra_purge = match (server_id, proxy::local_node_server_id(&app)) {
+        (Some(sid), Some(hub)) if sid == hub => vec![0],
+        _ => vec![],
+    };
+    match app.db.delete_proxy_node(id, &extra_purge) {
         Ok(()) => {
             if let Some(fqdn) = cdn_dns {
                 let app2 = app.clone();
@@ -3439,17 +3445,11 @@ pub async fn proxy_versions(
     Json(json!({ "versions": proxy::recent_versions(&app, repo).await })).into_response()
 }
 
-/// 入站 tag（in-{端口}）→ 协议名：先按 (server_id, 端口) 精确匹配，再按
-/// 镜像集匹配（切换主机后节点在镜像机上也有同端口采样），最后按端口单独
-/// 匹配但仅限同机历史别名（server_id=0 与挂到 agent 身份前的 hub 本机采样）。
-/// 盲兜底不收窄的话，两台机器同端口会把流量记到别人的节点名下。
-pub(crate) fn tag_node_name(bundles: &[crate::db::NodeBundle], server_id: i64, tag: &str) -> String {
-    tag_bundle(bundles, server_id, tag)
-        .map(|b| b.node.name.clone())
-        .unwrap_or_else(|| format!("{tag}（节点可能已删除）"))
-}
-
-/// tag → 节点行（排行跨机归并按节点 id 求和用），匹配次序同 tag_node_name。
+/// tag → 节点行（排行跨机归并按节点 id 求和用）：先按 (server_id, 端口)
+/// 精确匹配，再按镜像集匹配（切换主机后节点在镜像机上也有同端口采样），
+/// 最后按端口单独匹配但仅限同机历史别名（server_id=0 与挂到 agent 身份前
+/// 的 hub 本机采样）。盲兜底不收窄的话，两台机器同端口会把流量记到别人的
+/// 节点名下。解析不到返回 None——调用方按「已删节点残留」跳过。
 pub(crate) fn tag_bundle<'a>(
     bundles: &'a [crate::db::NodeBundle],
     server_id: i64,
@@ -3476,14 +3476,14 @@ pub async fn proxy_traffic(_: Admin, State(app): State<Shared>) -> Response {
             let bundles = app.db.proxy_node_bundles().unwrap_or_default();
             let list: Vec<Value> = rows
                 .iter()
-                .map(|(server_id, tag, trx, ttx, arx, atx)| {
-                    // 入站 tag 即 in-{端口}，按服务器 + 端口找回节点名。
-                    let node = tag_node_name(&bundles, *server_id, tag);
-                    json!({
+                .filter_map(|(server_id, tag, trx, ttx, arx, atx)| {
+                    // 已删节点的残留采样不显示（同概览排行的口径）。
+                    let node = tag_bundle(&bundles, *server_id, tag)?.node.name.clone();
+                    Some(json!({
                         "node": node,
                         "today_rx": trx, "today_tx": ttx,
                         "total_rx": arx, "total_tx": atx,
-                    })
+                    }))
                 })
                 .collect();
             Json(json!({ "traffic": list })).into_response()
@@ -3721,10 +3721,10 @@ pub async fn proxy_overview(_: Admin, State(app): State<Shared>, Query(q): Query
             let mut map: std::collections::BTreeMap<String, (String, i64, i64, i64, String)> =
                 std::collections::BTreeMap::new();
             for (server_id, tag, rx, tx) in rows {
-                let (key, name) = match tag_bundle(&nodes, server_id, &tag) {
-                    Some(b) => (format!("n{}", b.node.id), b.node.name.clone()),
-                    None => (format!("s{server_id}:{tag}"), format!("{tag}（节点可能已删除）")),
-                };
+                // 解析不到节点的 tag = 已删节点的残留采样：按用户口径直接
+                // 跳过，不再以「节点可能已删除」占行。
+                let Some(b) = tag_bundle(&nodes, server_id, &tag) else { continue };
+                let (key, name) = (format!("n{}", b.node.id), b.node.name.clone());
                 let mode = mode_of_server(server_id);
                 let billed = if with_billed { billed(rx, tx, &mode) } else { 0 };
                 let e = map.entry(key).or_insert((name, 0, 0, 0, mode));

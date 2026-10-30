@@ -684,7 +684,7 @@ pub async fn create_node(app: &Shared, mut node: ProxyNode) -> Result<i64> {
     // 节点同步诞生；指向记账一并落库，跟随同步不会重复重写。
     if let Some((ip, _)) = cdn.as_ref() {
         if let Err(e) = crate::dns::flip_proxy_node(app, &node.dns_name, ip, true).await {
-            let _ = app.db.delete_proxy_node(id);
+            let _ = app.db.delete_proxy_node(id, &[]);
             return Err(e);
         }
         app.db.set_proxy_dns_target(id, node.server_id, ip)?;

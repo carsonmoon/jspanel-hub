@@ -3068,7 +3068,7 @@ impl Db {
         Ok(())
     }
 
-    pub fn delete_proxy_node(&self, id: i64) -> Result<()> {
+    pub fn delete_proxy_node(&self, id: i64, extra_purge_servers: &[i64]) -> Result<()> {
         let mut conn = self.conn();
         let tx = conn.transaction()?;
         // 级联删除从未生效（hub 连接没开 PRAGMA foreign_keys，见
@@ -3091,6 +3091,10 @@ impl Db {
             let tag = format!("in-{listen_port}");
             let mut machines = vec![server_id];
             machines.extend(serde_json::from_str::<Vec<i64>>(mirrors.trim()).unwrap_or_default());
+            // hub 本机采样恒以 server_id=0 记账（本机身份归一前的历史口径）：
+            // 调用方判定被删节点涉本机渲染时传入 0，否则 hub 上的节点删了
+            // 采样永远残留，概览排行以「节点可能已删除」阴魂不散。
+            machines.extend(extra_purge_servers.iter().copied());
             for sid in machines {
                 tx.execute(
                     "DELETE FROM traffic_samples WHERE server_id = ?1 AND node_tag = ?2",
@@ -7006,7 +7010,7 @@ mod tests {
         db.add_traffic_samples(&[(7, "in-24000", Utc::now().timestamp(), 123, 456)]).unwrap();
         assert_eq!(db.proxy_traffic().unwrap().len(), 1);
 
-        db.delete_proxy_node(old).unwrap();
+        db.delete_proxy_node(old, &[]).unwrap();
         let fresh = db
             .create_proxy_node(
                 &ProxyNode { server_id: 1, name: "new".into(), ..node },
@@ -7837,7 +7841,7 @@ mod tests {
                 "cred2",
             )
             .unwrap();
-        db.delete_proxy_node(id).unwrap();
+        db.delete_proxy_node(id, &[]).unwrap();
         assert!(db.proxy_secret(id).unwrap().is_none(), "被删节点的 secret 必须清掉");
         // 幸存节点不受牵连。
         assert_eq!(db.proxy_secret(keep).unwrap().unwrap().private_key, "k2");
