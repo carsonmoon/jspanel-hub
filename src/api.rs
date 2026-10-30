@@ -3650,13 +3650,13 @@ pub struct OverviewQuery {
 
 pub async fn proxy_overview(_: Admin, State(app): State<Shared>, Query(q): Query<OverviewQuery>) -> Response {
     let now = Utc::now().timestamp();
-    // range → 统计窗口与桶粒度：6h/24h 分钟桶、7d/10 分钟桶、30d/小时桶
-    // （窗口长度不变），未知值回退 24h。
+    // range → 统计窗口与桶粒度：6h 分钟桶、24h 小时桶（对齐参考图：一小时
+    // 一点、逐小时标注）、7d/10 分钟桶、30d/小时桶，未知值回退 24h。
     let (since, bucket) = match q.range.as_deref() {
         Some("6h") => (now - 6 * 3_600, 60),
         Some("7d") => (now - 7 * 86_400, 600),
         Some("30d") => (now - 30 * 86_400, 3600),
-        _ => (now - 86_400, 60),
+        _ => (now - 86_400, 3_600),
     };
 
     match (|| -> anyhow::Result<serde_json::Value> {

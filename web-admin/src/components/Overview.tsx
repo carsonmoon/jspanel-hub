@@ -35,7 +35,7 @@ type Overview = {
 // 上限：8 天前的采样已压缩成小时行，更细的桶会失真。
 const RANGES = {
   "6h": { label: "6小时", buckets: 360, bucketSecs: 60, tickEvery: 60 },
-  "24h": { label: "24小时", buckets: 1440, bucketSecs: 60, tickEvery: 240 },
+  "24h": { label: "24小时", buckets: 24, bucketSecs: 3600, tickEvery: 1 },
   "7d": { label: "7天", buckets: 1008, bucketSecs: 10 * 60, tickEvery: 144 },
   "30d": { label: "30天", buckets: 720, bucketSecs: 3600, tickEvery: 120 },
 } as const
@@ -255,7 +255,9 @@ function ThroughputChart({ series, range }: { series: { bucket: number; rx: numb
             className="absolute top-0 whitespace-nowrap"
             style={{
               left: `${(x(i) / W) * 100}%`,
-              transform: i === 0 ? "translateX(0)" : i === buckets - 1 ? "translateX(-100%)" : "translateX(-50%)",
+              // 首标注同样居中（微出左侧留白，参考图同款）：左对齐会顶进
+              // 下一小时标注造成 03:00/04:00 重叠。
+              transform: i === buckets - 1 ? "translateX(-100%)" : "translateX(-50%)",
             }}
           >
             {i === buckets - 1 ? "现在" : fmtTick(i)}
