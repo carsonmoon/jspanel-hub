@@ -3723,9 +3723,22 @@ function useSessions() {
   return { rows, load }
 }
 
+// 折叠视图的行集：最近 n 条，当前设备不在其中时追加恒显（后端按过期倒序，
+// 当前会话可能是活得最短的那条，只 slice 会把它藏掉）。
+function visibleSessions(rows: Session[], n: number): Session[] {
+  const top = rows.slice(0, n)
+  const current = rows.find((s) => s.current)
+  if (current && !top.includes(current)) top.push(current)
+  return top
+}
+
 function Sessions({ rows, reload }: { rows: Session[]; reload: () => void }) {
   const [busy, setBusy] = useState(false)
   const [confirmAll, setConfirmAll] = useState(false)
+  // 默认只显示最近 5 条：旧会话只是堆积，展开才看全量（GitHub 样式改版时
+  // 弄丢的旧拍板，此处找回）。
+  const [showAll, setShowAll] = useState(false)
+  const visible = showAll ? rows : visibleSessions(rows, 5)
 
   // 下线一条或退出所有其它设备：id 省略 = 全部（当前会话服务端保留）。
   const drop = async (id?: string) => {
@@ -3756,7 +3769,7 @@ function Sessions({ rows, reload }: { rows: Session[]; reload: () => void }) {
         )}
       </div>
       <div className="flex flex-col">
-        {rows.map((s) => (
+        {visible.map((s) => (
           <div key={s.id} className="flex items-center justify-between gap-3 border-b py-2.5 last:border-b-0">
             <div className="flex min-w-0 items-center gap-3">
               <span className="flex size-9 shrink-0 items-center justify-center rounded-md bg-muted">
@@ -3782,6 +3795,16 @@ function Sessions({ rows, reload }: { rows: Session[]; reload: () => void }) {
           </div>
         ))}
       </div>
+      {rows.length > 5 && (
+        <Button
+          variant="ghost"
+          size="sm"
+          className="self-start text-xs text-muted-foreground"
+          onClick={() => setShowAll((v) => !v)}
+        >
+          {showAll ? "收起" : `显示全部 ${rows.length} 条`}
+        </Button>
+      )}
       {confirmAll && (
         <ConfirmDialog
           onClose={() => setConfirmAll(false)}
