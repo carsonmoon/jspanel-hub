@@ -25,7 +25,7 @@ SINGBOX=1
 SB_VERSION=""
 SUB_PORT=""
 SUB_PORT_SET=0
-# 中转核心（M5）：realm 不随装机默认安装——中转机第一次建中转规则时 agent
+# 转发核心（M5）：realm 不随装机默认安装——中转机第一次建转发规则时 agent
 # 会自动补装（apply 前版本自检）。--with-realm 给网络差、想提前装好的机器。
 # 隧道核心同理：gost 从不随装机安装，--with-gost 预装。
 REALM=0
@@ -543,12 +543,12 @@ UNIT
 	fi
 fi
 
-# ---- realm 核心（中转模块，--with-realm）----
+# ---- realm 核心（转发模块，--with-realm）----
 # 装 fork API 构建（realm api 单进程实例模型）：版本与 agent 仓 proxy.rs 的
 # REALM_API_VERSION 钉死值同步——不一致时 agent 在第一次 relay.apply 的版本
 # 自检里会自动重装正确版，这里只是提前放置。只装二进制：monitor-realm-api
-# 单元由 agent 在第一份中转配置推送时自写并启动。GitHub 不可达不视为失败：
-# 建中转规则时 agent 会自动补装。
+# 单元由 agent 在第一份转发配置推送时自写并启动。GitHub 不可达不视为失败：
+# 建转发规则时 agent 会自动补装。
 RL_FORK_VERSION="2.9.8-m1"
 if [ "$REALM" = 1 ]; then
 	RL_TARGET=""

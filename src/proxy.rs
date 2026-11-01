@@ -3123,13 +3123,13 @@ pub async fn ensure_remote_realm(app: &Shared, server_id: i64) -> Result<()> {
         .realm_installed = installed;
     if !installed {
         let job = app.db.add_agent_job(server_id, "relay.install", "")?;
-        // 补装版本用全局默认（设置页「代理核心」的 realm 项）：空 = 跟最新。
-        let want = app.db.get("realm_default_version").filter(|v| !v.trim().is_empty());
+        // 版本不传：agent 落回钉死的 REALM_API_VERSION——fork 序列外没有有意义的
+        // 版本，且 apply 前自检本就会纠正任何漂移（原设置页 realm 默认版本已删）。
         match crate::agent_ws::call_agent(
             app,
             server_id,
             "relay.install",
-            serde_json::json!({ "version": want }),
+            serde_json::json!({}),
             Duration::from_secs(300),
         )
         .await

@@ -2607,15 +2607,6 @@ function SettingsTab({ onSaved }: { onSaved: () => void }) {
               className="font-mono text-xs"
             />
           </Field>
-          <Field label="realm 默认版本" hint="自动补装共用，留空 = 最新版">
-            <Input
-              value={String(s.realm_default_version ?? "")}
-              onChange={(e) => set("realm_default_version", e.target.value.replace(/[^0-9.]/g, ""))}
-              placeholder="2.9.6"
-              spellCheck={false}
-              className="font-mono text-xs"
-            />
-          </Field>
           <Field
             label="CDN 共享证书"
             hint={
@@ -2682,7 +2673,6 @@ function SettingsTab({ onSaved }: { onSaved: () => void }) {
                 sub_hosts: String(s.sub_hosts ?? ""),
                 public_page: s.public_page === "off" ? "off" : "on",
                 singbox_default_version: String(s.singbox_default_version ?? ""),
-                realm_default_version: String(s.realm_default_version ?? ""),
                 // Cloudflare Token 是掩码写：留空 = 保持不变，填了才提交。
                 ...(typeof s.cf_api_token === "string" && s.cf_api_token ? { cf_api_token: s.cf_api_token } : {}),
                 // CDN 共享证书同款掩码写：两段各自留空不变，填了才提交。

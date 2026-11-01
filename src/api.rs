@@ -1244,8 +1244,6 @@ const READABLE_SETTINGS: &[&str] = &[
     // sing-box 全局默认版本（空 = 最新版）：新机安装命令与缺核心自动补装共用，
     // 计量走的 api service 是 1.14+ 特性，默认钉在实测过的 1.14.2。
     "singbox_default_version",
-    // realm 全局默认版本（空 = 最新版）：首次建隧道规则时的自动补装用它。
-    "realm_default_version",
 ];
 
 // ---- the database itself ----
@@ -1645,9 +1643,19 @@ async fn refresh_releases(app: &App) -> crate::Releases {
 pub async fn agent_release_tag(app: &App) -> Option<String> {
     let cached = app.releases.lock().unwrap().clone();
     if fresh_enough(&cached, Utc::now().timestamp()) {
+        if cached.agent.is_empty() {
+            // 每个 502 一条：装机操作者从日志对得上「这台为什么装不上」。
+            warn!(
+                "the agent release tag has been unreadable for {}s; agent installs fail until it clears",
+                Utc::now().timestamp() - cached.read_at
+            );
+        }
         return (!cached.agent.is_empty()).then(|| format!("v{}", cached.agent));
     }
     let read = refresh_releases(app).await;
+    if read.agent.is_empty() {
+        warn!("the agent release list could not be read from GitHub; agent installs fail (the update notice shares the silence)");
+    }
     (!read.agent.is_empty()).then(|| format!("v{}", read.agent))
 }
 
@@ -2019,12 +2027,6 @@ pub async fn settings(_: Admin, State(app): State<Shared>) -> Json<Value> {
         "singbox_default_version".into(),
         json!(app.db.get("singbox_default_version").unwrap_or_else(|| "1.14.2".into())),
     );
-    // realm 全局默认版本：从未设置时回空（= 跟最新版，realm 无面板硬依赖的
-    // 版本门槛，不像 sing-box 有 1.14+ 计量约束）。
-    out.insert(
-        "realm_default_version".into(),
-        json!(app.db.get("realm_default_version").unwrap_or_else(|| "2.9.6".into())),
-    );
     out.insert(
         "github_secret_set".into(),
         json!(app.db.get("github_client_secret").is_some_and(|v| !v.is_empty())),
@@ -2071,11 +2073,6 @@ fn setting_error(app: &App, key: &str, value: &Value) -> Option<String> {
             if !value.is_empty() && !value.chars().all(|c| c.is_ascii_digit() || c == '.') =>
         {
             Some("sing-box 默认版本只能含数字和点（如 1.14.2），留空表示最新版".into())
-        }
-        "realm_default_version"
-            if !value.is_empty() && !value.chars().all(|c| c.is_ascii_digit() || c == '.') =>
-        {
-            Some("realm 默认版本只能含数字和点（如 2.9.6），留空表示最新版".into())
         }
         // The hub fetches this URL itself, so it must be one: a scheme it cannot
         // speak turns every agent download into a 502 that says nothing about the
