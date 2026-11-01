@@ -2427,9 +2427,9 @@ pub fn render_relay_for_machine(app: &App, server_id: i64) -> Result<Option<(Str
     Ok(Some((body.clone(), hex::encode(Sha256::digest(body.as_bytes())))))
 }
 
-/// 信封里的一个 unit：一台机器上一条规则的独立 realm 配置。每 unit 一个
-/// systemd 单元（monitor-realm@<id>，id=规则 id）与一份 realm.toml——
-/// 改/停/删单条规则只动它的 unit，其他规则的已建连接不受牵连。
+/// 信封里的一个实例：id = 规则 id / "<规则id>-exit" / 占位 "main"；
+/// config 是 EndpointConf 的 canonical JSON **字符串**（sha256 对该串算，
+/// agent 原样转发给 realm HTTP API，字段序不经过中间人）。
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct RelayUnit {
     pub id: String,
@@ -2437,16 +2437,168 @@ pub struct RelayUnit {
     pub sha256: String,
 }
 
-/// 每规则独立 unit 的完整配置（relay.apply 信封 units 的来源）。
-pub fn render_relay_units(app: &App, server_id: i64) -> Result<Vec<RelayUnit>> {
-    Ok(relay_fragments_for_machine(app, server_id)?
-        .into_iter()
-        .map(|(id, frag)| {
-            let config = format!("[network]\nno_tcp = false\nuse_udp = true\n{frag}");
-            let sha256 = hex::encode(Sha256::digest(config.as_bytes()));
-            RelayUnit { id: id.to_string(), config, sha256 }
+/// realm-api 实例配置（字段名与 fork 的 EndpointConf 对齐——canonical
+/// 序列化后就是 POST /instances 的 body）。全局 network 留空、实例显式
+/// 覆盖，不留 take_field 合并口径；proxy protocol 放 network 嵌套（旧 toml
+/// 平铺键其实被 realm serde 静默忽略——本次顺带修正）。
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct InstanceConf {
+    pub listen: String,
+    pub remote: String,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub extra_remotes: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub balance: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub through: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub interface: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub listen_transport: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub remote_transport: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub network: Option<serde_json::Value>,
+}
+
+fn network_json(entries: &[(&str, bool)]) -> Option<serde_json::Value> {
+    let mut m = serde_json::Map::new();
+    for (k, v) in entries {
+        m.insert((*k).to_owned(), serde_json::json!(v));
+    }
+    (!m.is_empty()).then_some(serde_json::Value::Object(m))
+}
+
+fn rule_base_network(r: &crate::db::RelayRule) -> Vec<(&'static str, bool)> {
+    let mut v: Vec<(&'static str, bool)> = Vec::new();
+    match r.protocol.as_str() {
+        "tcp" => v.push(("use_udp", false)),
+        "udp" => v.push(("no_tcp", true)),
+        _ => {}
+    }
+    if r.mptcp {
+        v.push(("send_mptcp", true));
+        v.push(("accept_mptcp", true));
+    }
+    v
+}
+
+/// 每规则独立实例的完整配置（relay.apply 信封 units 的来源）。入口半边
+/// 实例 id = 规则 id；出口半边 = "<规则id>-exit"（同一规则两半同机时各为
+/// 一个实例——EndpointConf 只有一对 listen/remote）。
+pub fn render_relay_instances(app: &App, server_id: i64) -> Result<Vec<RelayUnit>> {
+    let rules: Vec<_> = app.db.relay_rules()?;
+    let all_targets = app.db.relay_targets()?;
+    let scopes = port_scopes(app, server_id);
+    let entry: Vec<_> = rules
+        .iter()
+        .filter(|r| {
+            r.enabled
+                && (scopes.contains(&r.server_id) || entry_backup_ids(r).iter().any(|b| scopes.contains(b)))
         })
-        .collect())
+        .collect();
+    let exits: Vec<_> = rules
+        .iter()
+        .filter(|r| r.enabled && scopes.contains(&r.exit_server_id) && r.exit_server_id != r.server_id)
+        .collect();
+    let targets_of = |rule_id: i64| -> Vec<crate::db::RelayTarget> {
+        all_targets.iter().filter(|t| t.rule_id == rule_id).cloned().collect()
+    };
+    let tunnel_host = |exit_server_id: i64| -> String {
+        if exit_server_id > 0 {
+            node_dial_host(app, exit_server_id, None)
+        } else {
+            String::new()
+        }
+    };
+    let mut out: Vec<RelayUnit> = Vec::new();
+    let mut push = |id: String, conf: InstanceConf| -> Result<()> {
+        let config = serde_json::to_string(&conf)?;
+        let sha256 = hex::encode(Sha256::digest(config.as_bytes()));
+        out.push(RelayUnit { id, config, sha256 });
+        Ok(())
+    };
+
+    for r in &entry {
+        let targets = effective_targets(&targets_of(r.id), &r.balance);
+        let remote: String = if r.exit_server_id > 0 {
+            let port: i64 = r.exit_listen_port.trim().parse().unwrap_or(0);
+            if port <= 0 {
+                continue;
+            }
+            format!("{}:{port}", node_dial_host(app, r.exit_server_id, None))
+        } else if let Some(t) = targets.first() {
+            format!("{}:{}", t.host, t.port)
+        } else {
+            if r.target.trim().is_empty() {
+                continue;
+            }
+            r.target.trim().to_owned()
+        };
+        let mut net = rule_base_network(r);
+        let mut remote_transport = None;
+        if r.exit_server_id > 0 && !r.transport.is_empty() {
+            remote_transport = Some(transport_str(r, TransportSide::Entry, &tunnel_host(r.exit_server_id)));
+            if r.send_proxy {
+                net.push(("send_proxy", true));
+            }
+        }
+        let (extra, balance) = if r.exit_server_id == 0 && targets.len() > 1 {
+            let extra: Vec<String> = targets[1..].iter().map(|t| format!("{}:{}", t.host, t.port)).collect();
+            let balance = if r.balance.is_empty() {
+                None
+            } else {
+                let weights: Vec<String> = targets.iter().map(|t| format!("{}", t.weight.max(1))).collect();
+                Some(format!("{}: {}", r.balance, weights.join(", ")))
+            };
+            (extra, balance)
+        } else {
+            (Vec::new(), None)
+        };
+        push(
+            r.id.to_string(),
+            InstanceConf {
+                listen: format!("{}:{}", listen_host_of(r), r.listen_port),
+                remote,
+                extra_remotes: extra,
+                balance,
+                through: (!r.through.trim().is_empty()).then(|| r.through.trim().to_owned()),
+                interface: (!r.interface.trim().is_empty()).then(|| r.interface.trim().to_owned()),
+                listen_transport: None,
+                remote_transport,
+                network: network_json(&net),
+            },
+        )?;
+    }
+
+    for r in &exits {
+        let targets = effective_targets(&targets_of(r.id), &r.balance);
+        let Some(first) = targets.first() else { continue };
+        let Ok(port) = r.exit_listen_port.trim().parse::<i64>() else { continue };
+        let mut net = rule_base_network(r);
+        let mut listen_transport = None;
+        if !r.transport.is_empty() {
+            listen_transport = Some(transport_str(r, TransportSide::Exit, &tunnel_host(r.exit_server_id)));
+            if r.send_proxy {
+                net.push(("accept_proxy", true));
+            }
+        }
+        push(
+            format!("{}-exit", r.id),
+            InstanceConf {
+                listen: format!("0.0.0.0:{port}"),
+                remote: format!("{}:{}", first.host, first.port),
+                extra_remotes: Vec::new(),
+                balance: None,
+                through: None,
+                interface: None,
+                listen_transport,
+                remote_transport: None,
+                network: network_json(&net),
+            },
+        )?;
+    }
+    Ok(out)
 }
 
 /// 机器级聚合指纹：unit 按 id 升序，拼接 "id\nsha256\n" 后取 sha256。
@@ -2865,13 +3017,17 @@ pub async fn apply_relay_after_change(app: &Shared, server_id: i64) -> bool {
 /// 取同一口径——曾因对账只看规则渲染（占位不在期望集内）而推送会推占位，
 /// agent 忠实落盘后指纹永不相等，每 60s 心跳重推并重启一次 realm。
 fn relay_expected(app: &App, server_id: i64) -> Result<(Vec<RelayUnit>, String)> {
-    let mut units = render_relay_units(app, server_id)?;
+    let mut units = render_relay_instances(app, server_id)?;
     if units.is_empty() && realm_desired_running(app) && port_scopes(app, server_id).contains(&0) {
-        let body = placeholder_relay_body();
+        let conf = serde_json::json!({
+            "listen": "127.0.0.1:19998",
+            "remote": "127.0.0.1:9",
+        });
+        let config = serde_json::to_string(&conf)?;
         units.push(RelayUnit {
             id: "main".into(),
-            sha256: hex::encode(Sha256::digest(body.as_bytes())),
-            config: body,
+            sha256: hex::encode(Sha256::digest(config.as_bytes())),
+            config,
         });
     }
     let refs: Vec<(&str, &str)> = units.iter().map(|u| (u.id.as_str(), u.sha256.as_str())).collect();
@@ -5157,10 +5313,15 @@ mod relay_render_tests {
         // 有规则：期望=每规则一个 unit，聚合=units_aggregate（对账同口径）。
         let app = app_with_rule(base_rule(), &[("1.1.1.1", 443)]);
         let (units, hash) = relay_expected(&app, 1).unwrap();
-        let rendered = render_relay_units(&app, 1).unwrap();
+        let rendered = render_relay_instances(&app, 1).unwrap();
         assert_eq!(units.len(), 1);
-        assert_eq!(units[0].id, "1", "unit id = 规则 id");
+        assert_eq!(units[0].id, "1", "实例 id = 规则 id");
         assert_eq!(units[0].config, rendered[0].config);
+        // config 是 canonical JSON 字符串：能反解析回 EndpointConf 形状。
+        let cfg: serde_json::Value = serde_json::from_str(&units[0].config).unwrap();
+        assert_eq!(cfg["listen"], "0.0.0.0:21580", "{cfg}");
+        assert_eq!(cfg["remote"], "1.1.1.1:443", "{cfg}");
+        assert!(cfg.get("network").is_none(), "both 协议无覆盖时不输出 network: {cfg}");
         let refs: Vec<(&str, &str)> = units.iter().map(|u| (u.id.as_str(), u.sha256.as_str())).collect();
         assert_eq!(hash, units_aggregate(&refs));
 
@@ -5171,7 +5332,9 @@ mod relay_render_tests {
         let (units, _) = relay_expected(&app, 0).unwrap();
         assert_eq!(units.len(), 1, "本机作用域+开关开应只含占位 unit");
         assert_eq!(units[0].id, "main");
-        assert_eq!(units[0].config, placeholder_relay_body());
+        let ph: serde_json::Value = serde_json::from_str(&units[0].config).unwrap();
+        assert_eq!(ph["listen"], "127.0.0.1:19998", "{ph}");
+        assert_eq!(ph["remote"], "127.0.0.1:9", "{ph}");
 
         // 无规则的远程机：占位仅限本机作用域，远程期望空清理。
         let (units, hash) = relay_expected(&app, 7).unwrap();
