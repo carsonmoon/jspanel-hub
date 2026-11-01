@@ -1,6 +1,6 @@
 import { memo, useCallback, useEffect, useId, useRef, useState } from "react"
 import { flushSync } from "react-dom"
-import { ArrowUpCircle, Bell, CalendarClock, Check, ChevronDown, ChevronRight, CircleQuestionMark, Copy, Database, Download, Globe, GripVertical, Layers, LogOut, Monitor, Palette, Pencil, Plus, Radio, RefreshCw, Rss, Search, Send, Server, Settings, Shield, SlidersHorizontal, Trash2, Upload, Users as UsersIcon, Waypoints, ScrollText, LayoutDashboard } from "lucide-react"
+import { ArrowUpCircle, ArrowLeftRight, Bell, CalendarClock, Check, ChevronDown, ChevronRight, CircleQuestionMark, Copy, Database, Download, Globe, GripVertical, Layers, LogOut, Monitor, Palette, Pencil, Plus, Radio, RefreshCw, Rss, Search, Send, Server, Settings, Shield, SlidersHorizontal, Trash2, Upload, Users as UsersIcon, Waypoints, ScrollText, LayoutDashboard } from "lucide-react"
 import { toast } from "sonner"
 
 import { Badge } from "@/components/ui/badge"
@@ -22,6 +22,7 @@ import { bytes, cycleMonths, FOREVER, money, uptime } from "@/lib/format"
 import Proxy from "@/components/Proxy"
 import Overview from "@/components/Overview"
 import Tunnel from "@/components/Tunnel"
+import Gost from "@/components/Gost"
 import Logs from "@/components/Logs"
 import Subscribe from "@/components/Subscribe"
 import Users from "@/components/Users"
@@ -4270,6 +4271,7 @@ const ADMIN_SECTIONS = [
   { path: "/admin/nodes", label: "主机", icon: Server },
   { path: "/admin/proxy", label: "代理", icon: Globe },
   { path: "/admin/tunnel", label: "转发", icon: Waypoints },
+  { path: "/admin/gost", label: "隧道", icon: ArrowLeftRight },
   { path: "/admin/users", label: "用户", icon: UsersIcon },
   { path: "/admin/subscribe", label: "订阅", icon: Rss },
   { path: "/admin/logs", label: "日志", icon: ScrollText },
@@ -4336,6 +4338,8 @@ export function Admin({
           <Proxy />
         ) : path === "/admin/tunnel" ? (
           <Tunnel />
+        ) : path === "/admin/gost" ? (
+          <Gost />
         ) : path === "/admin/users" ? (
           <Users />
         ) : path === "/admin/subscribe" ? (

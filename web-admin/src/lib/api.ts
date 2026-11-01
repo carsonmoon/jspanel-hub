@@ -443,6 +443,33 @@ export type RealmStatus = {
   supports_transport?: boolean
 }
 
+/** 一条 gost 转发/隧道规则（隧道页）。exit_server_id>0 = 隧道转发。 */
+export type GostRule = {
+  id: number
+  server_id: number
+  name: string
+  exit_server_id: number
+  /** '' / tls / wss / tcp：隧道节点间协议（端口转发为空） */
+  transport: string
+  listen_port: string
+  exit_listen_port: string
+  /** 换行分隔的 host:port 落地目标 */
+  targets: string
+  /** '' / fifo(主备) / round(轮询) / rand(随机) / hash(IP哈希) */
+  balance: string
+  udp: boolean
+  enabled: boolean
+  created_at: number
+  /** 服务端派生：tunnel / forward（不入库） */
+  mode?: string
+}
+
+export type GostData = {
+  rules: GostRule[]
+  port_pool: string
+  gost_version: string
+}
+
 
 /**
  * Every error the hub answers is one line of plain text written for the reader.
