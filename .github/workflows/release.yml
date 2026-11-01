@@ -106,18 +106,18 @@ jobs:
           echo "$GH_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
           VERSION="${GITHUB_REF_NAME#v}"
           IMAGE="ghcr.io/${GITHUB_REPOSITORY,,}"
-          TAGS="-t $IMAGE:$VERSION -t $IMAGE:latest"
+          TAGS=(-t "$IMAGE:$VERSION" -t "$IMAGE:latest")
           if [ -n "$DOCKERHUB_TOKEN" ]; then
             echo "$DOCKERHUB_TOKEN" | docker login -u "$DOCKERHUB_USERNAME" --password-stdin
             # Same repository name as on GitHub, under the account the token belongs to.
             HUB="docker.io/$DOCKERHUB_USERNAME/${GITHUB_REPOSITORY##*/}"
-            TAGS="$TAGS -t $HUB:$VERSION -t $HUB:latest"
+            TAGS+=(-t "$HUB:$VERSION" -t "$HUB:latest")
           else
             echo "no Docker Hub credentials configured; publishing to ghcr only"
           fi
           # The default builder cannot produce two platforms in one manifest.
           docker buildx create --use --driver docker-container
-          docker buildx build --platform linux/amd64,linux/arm64 --push $TAGS .
+          docker buildx build --platform linux/amd64,linux/arm64 --push "${TAGS[@]}" .
         env:
           GH_TOKEN: ${{ github.token }}
           DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}

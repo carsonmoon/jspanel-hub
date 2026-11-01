@@ -23,6 +23,11 @@ cd "$DIR"
 # test 三连跑过，才进昂贵的 docker 构建——CI 从未运行过的纪律接到部署关口。
 # 2026-10-27 agent 仓 lint 债清零后同设。collect 的三个环境依赖测试读真实
 # hostname/free/df（macOS 沙盒必红，HANDOFF 既有非回归），agent 路径按名跳过。
+if command -v actionlint >/dev/null 2>&1; then
+  actionlint .github/workflows/*.yml
+else
+  echo "提示: 本机无 actionlint，跳过 workflow 检查（brew install actionlint 可启用）"
+fi
 cargo fmt --all --check
 cargo clippy --all-targets -- -D warnings
 if [ "$TARGET" = hub ]; then

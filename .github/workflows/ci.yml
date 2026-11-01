@@ -16,6 +16,8 @@ concurrency:
 jobs:
   check:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     # A hanging test would otherwise consume the six-hour default; a cold build
     # plus the suite takes a few minutes.
     timeout-minutes: 20
@@ -41,9 +43,17 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rustfmt
+      # workflow 自身的机械检查：管道吞退出码/路径错位类错误在 run 步里，
+      # shellcheck 够不到（retro 2026-11-02）。
+      - run: |
+          bash <(curl -fsSL https://raw.githubusercontent.com/rhysd/actionlint/main/scripts/download-actionlint.bash)
+          ./actionlint -color
       - run: cargo fmt --all --check
       - run: cargo clippy --all-targets -- -D warnings
-      - run: cargo test
+      # 管道吞退出码的老课（HANDOFF 记载）——tee 步必须带 pipefail。
+      - run: |
+          set -o pipefail
+          cargo test 2>&1 | tee test.log
 
       # Both installers run as root on the user's machine. Notes below warning
       # level are all SC2015 on `[ a ] && [ b ] || die`, which is meant to die
@@ -57,3 +67,18 @@ jobs:
           curl -fsSL -o agent https://github.com/monitor-probe/agent/releases/latest/download/monitor-agent-x86_64-unknown-linux-musl
           chmod +x agent
       - run: scripts/e2e.sh target/debug/monitor-hub ./agent
+
+      # Actions 日志页对无 admin 权限的排查者 403、artifact 下载 401（retro
+      # 2026-11-02）——失败测试日志挂 ci-debug prerelease，Release 资产匿名可下。
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: test-log
+          path: test.log
+      - uses: softprops/action-gh-release@v2
+        if: failure()
+        with:
+          tag_name: ci-debug
+          name: CI 调试产物（失败时自动覆盖）
+          prerelease: true
+          files: test.log
