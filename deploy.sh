@@ -7,6 +7,11 @@
 #   MONITOR_DEPLOY_HOST  必填，scp/ssh 目标，如 root@10.0.0.1
 #   MONITOR_PANEL_URL    选填，如 https://panel.example.com；设置时输出前端指纹
 set -e
+# 失败必须看得见（retro 2026-11-02）：本脚本常被 `| tail` 包着调——管道吞掉
+# 退出码，fmt 拦截曾被读成「exit 0 部署成功」。EXIT trap 是 POSIX 的（dash 也
+# 支持，ERR 不是），失败时把 rc 打进输出尾部；成功的判据见最后一行终态。
+# shellcheck disable=SC2154  # rc 在 trap 触发时才赋值，静态分析看不见
+trap 'rc=$?; [ "$rc" -eq 0 ] || echo "deploy: FAILED (rc=$rc)" >&2' EXIT
 
 TARGET="${1:-hub}"
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -61,3 +66,5 @@ if [ "$TARGET" = hub ] && [ -n "${MONITOR_PANEL_URL:-}" ]; then
   echo "admin 指纹:  $MAIN_FP"
   echo "用户中心指纹: $USER_FP"
 fi
+# 终态行：成败判据在此（外层管道吞退出码时，看输出尾部有没有这行）。
+echo "deploy: ✓ $TARGET 完成"
