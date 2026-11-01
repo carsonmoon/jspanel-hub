@@ -2258,6 +2258,10 @@ pub fn effective_targets(targets: &[crate::db::RelayTarget], balance: &str) -> V
 /// 「主」节点行的规则同住一份 realm.toml，必须合并渲染、单点写入——此前
 /// 每身份各渲染各的，后写的把先写的端点整块抹掉。纯远程机器 scopes 只有
 /// 自己一个，行为与旧的按身份渲染完全一致。
+/// 【已知重复，评审 2026-11-02 记录接受】本函数与 render_relay_instances
+/// 平行维护同一套 entry/exits 过滤与字段决策——本份只服务无 agent 的本机
+/// 直连路径（生产 hub 均有 agent，此路仅 dev 活着），收敛收益小于回归风险；
+/// 改动转发渲染语义时两处必须一起核对。
 fn relay_fragments_for_machine(app: &App, server_id: i64) -> Result<Vec<(i64, String)>> {
     let rules: Vec<_> = app.db.relay_rules()?;
     let all_targets = app.db.relay_targets()?;
@@ -3019,10 +3023,18 @@ pub async fn apply_relay_after_change(app: &Shared, server_id: i64) -> bool {
 fn relay_expected(app: &App, server_id: i64) -> Result<(Vec<RelayUnit>, String)> {
     let mut units = render_relay_instances(app, server_id)?;
     if units.is_empty() && realm_desired_running(app) && port_scopes(app, server_id).contains(&0) {
-        let conf = serde_json::json!({
-            "listen": "127.0.0.1:19998",
-            "remote": "127.0.0.1:9",
-        });
+        // 占位实例也走 InstanceConf——config 形状单一来源（评审 2026-11-02）。
+        let conf = InstanceConf {
+            listen: "127.0.0.1:19998".into(),
+            remote: "127.0.0.1:9".into(),
+            extra_remotes: Vec::new(),
+            balance: None,
+            through: None,
+            interface: None,
+            listen_transport: None,
+            remote_transport: None,
+            network: None,
+        };
         let config = serde_json::to_string(&conf)?;
         units.push(RelayUnit {
             id: "main".into(),
@@ -4136,7 +4148,13 @@ pub async fn on_agent_hash_ext(
         }
         // 每 unit 状态快照（转发页徽标数据源）：老 agent 不带此字段 → 清空
         // （徽标回退未知态），不影响其他对账状态。
-        st.relay_units = relay_units.and_then(|v| serde_json::from_value(v).ok()).unwrap_or_default();
+        match relay_units.map(serde_json::from_value::<HashMap<String, RelayUnitStatus>>) {
+            Some(Ok(map)) => st.relay_units = map,
+            Some(Err(e)) => {
+                eprintln!("[hash] node {server_id}: relay_units 解析失败（忽略本拍徽标数据）: {e}")
+            }
+            None => st.relay_units.clear(),
+        }
     }
     let rendered = render_for_server(app, server_id)?;
     // sing-box 对账：agent 持有配置但期望为空（节点全停用/删除）→ 推空配置摘除。

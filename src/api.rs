@@ -4249,7 +4249,7 @@ pub async fn relay_list(_: Admin, State(app): State<Shared>) -> Response {
         Err(e) => return fail(e),
     };
     let all_targets = app.db.relay_targets().unwrap_or_default();
-    // 每 unit 运行态快照（心跳 relay_units 捎带，monitor-realm@<规则id>）：
+    // 每 unit 运行态快照（心跳 relay_units 捎带，monitor-realm-api 的实例）：
     // 规则行徽标的数据源。查不到 = 该机 agent 离线或老 agent 未上报 → Null
     // （前端显示未知，不猜）。
     let unit_states: std::collections::HashMap<i64, std::collections::HashMap<String, bool>> = app
@@ -4270,15 +4270,16 @@ pub async fn relay_list(_: Admin, State(app): State<Shared>) -> Response {
             };
             v["targets"] = json!(all_targets.iter().filter(|t| t.rule_id == r.id).collect::<Vec<_>>());
             // unit 运行态：入口机必查；隧道规则再看落地机（两端各一 unit）。
-            let unit_on = |sid: i64| -> Value {
-                unit_states
-                    .get(&sid)
-                    .and_then(|m| m.get(&r.id.to_string()))
-                    .map(|a| json!(a))
-                    .unwrap_or(Value::Null)
+            let unit_on = |sid: i64, unit_id: &str| -> Value {
+                unit_states.get(&sid).and_then(|m| m.get(unit_id)).map(|a| json!(a)).unwrap_or(Value::Null)
             };
-            v["entry_running"] = unit_on(r.server_id);
-            v["exit_running"] = if r.exit_server_id > 0 { unit_on(r.exit_server_id) } else { Value::Null };
+            v["entry_running"] = unit_on(r.server_id, &r.id.to_string());
+            // 出口半边实例 id 是 <规则id>-exit（render_relay_instances 的约定）。
+            v["exit_running"] = if r.exit_server_id > 0 {
+                unit_on(r.exit_server_id, &format!("{}-exit", r.id))
+            } else {
+                Value::Null
+            };
             v
         })
         .collect();
