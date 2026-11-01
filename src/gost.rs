@@ -229,7 +229,9 @@ pub fn render_gost_for_machine(app: &crate::App, server_id: i64) -> Result<Optio
                     "nodes": [{
                         "name": format!("gost-{}-exit", r.id),
                         "addr": format!("{}:{exit_port}", crate::proxy::node_dial_host(app, r.exit_server_id, None)),
-                        "connector": { "type": "relay" },
+                        // nodelay：relay 请求立即冲出——默认缓冲等首包，纯服务端
+                        // 先说话的协议（SMTP 220 等）会死锁（E2E 实测）。
+                        "connector": { "type": "relay", "metadata": { "nodelay": true } },
                         "dialer": { "type": r.transport },
                     }],
                 }],
@@ -270,6 +272,8 @@ pub fn render_gost_for_machine(app: &crate::App, server_id: i64) -> Result<Optio
             "addr": format!("[::]:{port}"),
             "handler": { "type": "relay" },
             "listener": { "type": r.transport },
+            // nodelay：relay 响应头立即发出，不与首包合并（与入口 connector 同理由）。
+            "metadata": { "nodelay": true },
             "forwarder": forwarder(&targets, &r.balance),
         }));
     }
@@ -324,7 +328,7 @@ pub fn reconcile_gost_push(app: &crate::App, server_id: i64) -> Result<bool> {
 
 /// 规则变更后两侧收敛：入口机 + 出口机（隧道）。推送失败不回滚——心跳
 /// 对账每拍重试，与 relay 同款最终一致语义。
-pub async fn apply_rule(app: &crate::Shared, r: &GostRule) -> bool {
+pub async fn apply_rule(app: &crate::App, r: &GostRule) -> bool {
     let mut ok = apply_gost_after_change(app, r.server_id).await;
     if r.exit_server_id > 0 {
         ok &= apply_gost_after_change(app, r.exit_server_id).await;
@@ -332,7 +336,7 @@ pub async fn apply_rule(app: &crate::Shared, r: &GostRule) -> bool {
     ok
 }
 
-pub async fn apply_gost_after_change(app: &crate::Shared, server_id: i64) -> bool {
+pub async fn apply_gost_after_change(app: &crate::App, server_id: i64) -> bool {
     if let Err(e) = ensure_remote_gost(app, server_id).await {
         warn!("auto gost install skipped: {e:#}");
     }
@@ -353,7 +357,7 @@ pub async fn apply_gost_after_change(app: &crate::Shared, server_id: i64) -> boo
 }
 
 /// 远程机器缺 gost 二进制时自动补装（镜像 ensure_remote_realm）。
-pub async fn ensure_remote_gost(app: &crate::Shared, server_id: i64) -> Result<()> {
+pub async fn ensure_remote_gost(app: &crate::App, server_id: i64) -> Result<()> {
     let known = {
         let st = app.proxy_remote.lock().unwrap_or_else(|e| e.into_inner());
         st.get(&server_id).map(|s| s.gost_installed).unwrap_or(false)

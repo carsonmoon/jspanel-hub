@@ -3953,6 +3953,12 @@ pub async fn on_agent_hash_ext(
         let (_, want) = crate::gost::gost_expected(app, server_id)?;
         let desired_running = !want.is_empty();
         if want != gost_hash {
+            // 未收敛：先把二进制补齐（缓存命中时是零开销早退），再推配置。
+            // 首次建规则时 API 端的安装可能随客户端断开被 drop——对账是
+            // 它的兜底，只推不装会让 agent 每 60s 撞一次「尚未安装」。
+            if let Err(e) = crate::gost::ensure_remote_gost(app, server_id).await {
+                warn!("node {server_id}: gost ensure-install failed: {e:#}");
+            }
             let pushed = crate::gost::reconcile_gost_push(app, server_id)?;
             eprintln!("[hash] gost reconcile: want={want:?} got={gost_hash:?} pushed={pushed}");
         } else if desired_running && server_id != 0 {

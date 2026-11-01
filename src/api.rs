@@ -4480,8 +4480,14 @@ pub async fn create_gost_rule(
         Err(e) => return fail(e),
     };
     rule.id = id;
-    // 推送失败不回滚：心跳对账每拍重试（与 relay 同款最终一致语义）。
-    crate::gost::apply_rule(&app, &rule).await;
+    // 后台收敛（补装+推送最长数分钟，不能拖住 HTTP——客户端断开会把
+    // inline future 一起 drop，首次安装死在半路）；推送失败不回滚：心跳
+    // 对账每拍重试（与 relay 同款最终一致语义）。
+    let shared = app.clone();
+    let spawned = rule.clone();
+    tokio::spawn(async move {
+        crate::gost::apply_rule(&shared, &spawned).await;
+    });
     Json(json!({ "id": id })).into_response()
 }
 
@@ -4506,7 +4512,12 @@ pub async fn update_gost_rule(
         return fail(e);
     }
     // 入口/出口机换过时旧机器靠心跳对账收敛成空期望（与 relay 同款）。
-    crate::gost::apply_rule(&app, &rule).await;
+    // 后台化理由同 create：安装+推送不能被客户端断开拖死。
+    let shared = app.clone();
+    let spawned = rule.clone();
+    tokio::spawn(async move {
+        crate::gost::apply_rule(&shared, &spawned).await;
+    });
     Json(json!({ "ok": true })).into_response()
 }
 
@@ -4517,11 +4528,14 @@ pub async fn delete_gost_rule(_: Admin, State(app): State<Shared>, Path(id): Pat
     if let Err(e) = app.db.delete_gost_rule(id) {
         return fail(e);
     }
-    // 删除后两侧期望为空 → 推空让 agent 停服务清文件。
-    crate::gost::apply_gost_after_change(&app, rule.server_id).await;
-    if rule.exit_server_id > 0 && rule.exit_server_id != rule.server_id {
-        crate::gost::apply_gost_after_change(&app, rule.exit_server_id).await;
-    }
+    // 删除后两侧期望为空 → 推空让 agent 停服务清文件。后台化理由同 create。
+    let shared = app.clone();
+    tokio::spawn(async move {
+        crate::gost::apply_gost_after_change(&shared, rule.server_id).await;
+        if rule.exit_server_id > 0 && rule.exit_server_id != rule.server_id {
+            crate::gost::apply_gost_after_change(&shared, rule.exit_server_id).await;
+        }
+    });
     Json(json!({ "ok": true })).into_response()
 }
 
