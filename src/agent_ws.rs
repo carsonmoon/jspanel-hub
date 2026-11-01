@@ -580,6 +580,7 @@ fn dispatch(
         "proxy.hash" => {
             let hash = rpc.params.get("hash").and_then(|v| v.as_str()).unwrap_or("").to_owned();
             let relay_hash = rpc.params.get("relay_hash").and_then(|v| v.as_str()).map(str::to_owned);
+            let gost_hash = rpc.params.get("gost_hash").and_then(|v| v.as_str()).map(str::to_owned);
             // sing-box 版本随心跳捎带（二期）：喂协议页的版本过旧黄条；旧
             // agent 不带此字段，缓存保持原值。
             let version = rpc.params.get("version").and_then(|v| v.as_str()).map(str::to_owned);
@@ -590,6 +591,7 @@ fn dispatch(
                     node_id,
                     &hash,
                     relay_hash.as_deref(),
+                    gost_hash.as_deref(),
                     version.as_deref(),
                 )
                 .await

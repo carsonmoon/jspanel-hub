@@ -361,7 +361,7 @@ CREATE TABLE IF NOT EXISTS session (
 /// 模式，template_name 可为空）。
 /// Bumped to 28（第二次使用）for 订阅文件节点勾选：sub_profiles 加
 /// selected_nodes（勾选的节点 id 数组，非空 = 只包含这些节点）。
-const SCHEMA_VERSION: i64 = 56;
+const SCHEMA_VERSION: i64 = 57;
 
 /// Adds a column older databases lack. A duplicate column indicates the
 /// migration has already run; every other error must propagate.
@@ -1341,6 +1341,29 @@ fn migrate_to_56(conn: &Connection) -> Result<()> {
     unify_local_sampling_rows(conn, local_id)
 }
 
+/// gost 转发/隧道规则（隧道模块批次1）。exit_server_id>0 即隧道转发
+/// （入口→出口加密链），=0 即同机端口转发。身份纪律沿用 v47：规则只能
+/// 挂真实节点行（server_id>0），本机经其节点行表达。
+fn migrate_to_57(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS gost_rules (
+          id INTEGER PRIMARY KEY,
+          server_id INTEGER NOT NULL CHECK (server_id > 0),
+          name TEXT NOT NULL,
+          exit_server_id INTEGER NOT NULL DEFAULT 0,
+          transport TEXT NOT NULL DEFAULT '',
+          listen_port TEXT NOT NULL DEFAULT '',
+          exit_listen_port TEXT NOT NULL DEFAULT '',
+          targets TEXT NOT NULL DEFAULT '',
+          balance TEXT NOT NULL DEFAULT '',
+          udp INTEGER NOT NULL DEFAULT 1,
+          enabled INTEGER NOT NULL DEFAULT 1,
+          created_at INTEGER NOT NULL
+        );",
+    )?;
+    Ok(())
+}
+
 /// 本机采样身份的解析：hostname 匹配 node 表的行。任何一步不可得
 /// （纯 hub / 老库缺列 / 无 hostname）返回 None，调用方跳过重写。
 fn local_sampling_identity(conn: &Connection) -> Option<i64> {
@@ -1677,6 +1700,9 @@ fn migrate_inner(conn: &Connection, from: i64) -> Result<()> {
     }
     if from < 56 {
         migrate_to_56(&tx)?;
+    }
+    if from < 57 {
+        migrate_to_57(&tx)?;
     }
     let fk_after = fk_violation_rows(conn)?;
     if fk_after.len() > fk_before.len() {
@@ -2272,6 +2298,45 @@ fn default_view_mode() -> String {
     "overview".into()
 }
 
+/// 一条 gost 转发/隧道规则（隧道模块批次1，扁平模型）。exit_server_id>0 =
+/// 隧道转发（入口→出口加密链，出口侧再转 targets）；=0 = 同机端口转发
+/// （targets 直接落地，多目标走 balance 选择策略）。targets 换行分隔
+/// host:port。
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+pub struct GostRule {
+    #[serde(default)]
+    pub id: i64,
+    /// 入口机：真实节点行主键（0 身份已退役，同 relay v47 纪律）。
+    #[serde(default)]
+    pub server_id: i64,
+    #[serde(default)]
+    pub name: String,
+    /// 出口机：0 = 同机端口转发，>0 = 隧道转发。
+    #[serde(default)]
+    pub exit_server_id: i64,
+    /// 隧道节点间协议：tls / wss / tcp（端口转发为空）。
+    #[serde(default)]
+    pub transport: String,
+    /// 入口监听端口（留空由服务端自动分配）。
+    #[serde(default)]
+    pub listen_port: String,
+    /// 隧道出口监听端口（入口连它的加密端）。
+    #[serde(default)]
+    pub exit_listen_port: String,
+    /// 落地目标列表，换行分隔 host:port。
+    #[serde(default)]
+    pub targets: String,
+    /// 多目标选择策略：fifo(主备)/round(轮询)/rand(随机)/hash(IP哈希)。
+    #[serde(default)]
+    pub balance: String,
+    #[serde(default = "yes")]
+    pub udp: bool,
+    #[serde(default = "yes")]
+    pub enabled: bool,
+    #[serde(default)]
+    pub created_at: i64,
+}
+
 /// 一条 Realm 中转规则（M5）：中转机监听端口，把流量原样转发到落地地址。
 /// M24 起支持多落地（relay_targets 子表）、每规则协议选择、负载均衡与
 /// 加密隧道（transport/exit_* ——hub 同源渲染两端 realm.toml，参数天然配对）。
@@ -2631,6 +2696,23 @@ fn row_to_sub_profile(r: &rusqlite::Row) -> rusqlite::Result<SubProfile> {
         static_content,
         agent_dist: agent_dist != 0,
         expires_at: r.get("expires_at")?,
+        enabled: r.get::<_, i64>("enabled")? != 0,
+        created_at: r.get("created_at")?,
+    })
+}
+
+fn row_to_gost_rule(r: &rusqlite::Row) -> rusqlite::Result<GostRule> {
+    Ok(GostRule {
+        id: r.get("id")?,
+        server_id: r.get("server_id")?,
+        name: r.get("name")?,
+        exit_server_id: r.get("exit_server_id")?,
+        transport: r.get("transport")?,
+        listen_port: r.get("listen_port")?,
+        exit_listen_port: r.get("exit_listen_port")?,
+        targets: r.get("targets")?,
+        balance: r.get("balance")?,
+        udp: r.get::<_, i64>("udp")? != 0,
         enabled: r.get::<_, i64>("enabled")? != 0,
         created_at: r.get("created_at")?,
     })
@@ -4410,6 +4492,74 @@ impl Db {
         tx.execute("DELETE FROM relay_hop_state WHERE rule_id = ?1", [id])?;
         tx.execute("DELETE FROM relay_rules WHERE id = ?1", [id])?;
         tx.commit()?;
+        Ok(())
+    }
+
+    // ---- gost 转发/隧道规则（隧道模块批次1）----
+
+    pub fn gost_rules(&self) -> Result<Vec<GostRule>> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare("SELECT * FROM gost_rules ORDER BY id")?;
+        let rows = stmt.query_map([], row_to_gost_rule)?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    pub fn gost_rule(&self, id: i64) -> Result<Option<GostRule>> {
+        Ok(self
+            .conn()
+            .query_row("SELECT * FROM gost_rules WHERE id = ?1", [id], row_to_gost_rule)
+            .optional()?)
+    }
+
+    pub fn create_gost_rule(&self, r: &GostRule) -> Result<i64> {
+        self.conn().execute(
+            "INSERT INTO gost_rules (server_id, name, exit_server_id, transport, listen_port,
+               exit_listen_port, targets, balance, udp, enabled, created_at)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
+            params![
+                r.server_id,
+                r.name,
+                r.exit_server_id,
+                r.transport,
+                r.listen_port,
+                r.exit_listen_port,
+                r.targets,
+                r.balance,
+                r.udp as i64,
+                r.enabled as i64,
+                Utc::now().timestamp(),
+            ],
+        )?;
+        Ok(self.conn().last_insert_rowid())
+    }
+
+    pub fn update_gost_rule(&self, r: &GostRule) -> Result<()> {
+        let res = self.conn().execute(
+            "UPDATE gost_rules SET server_id=?2, name=?3, exit_server_id=?4, transport=?5,
+               listen_port=?6, exit_listen_port=?7, targets=?8, balance=?9, udp=?10, enabled=?11
+             WHERE id=?1",
+            params![
+                r.id,
+                r.server_id,
+                r.name,
+                r.exit_server_id,
+                r.transport,
+                r.listen_port,
+                r.exit_listen_port,
+                r.targets,
+                r.balance,
+                r.udp as i64,
+                r.enabled as i64,
+            ],
+        )?;
+        if res == 0 {
+            return Err(anyhow::Error::msg(crate::Shown("隧道规则不存在，可能已被删除".into())));
+        }
+        Ok(())
+    }
+
+    pub fn delete_gost_rule(&self, id: i64) -> Result<()> {
+        self.conn().execute("DELETE FROM gost_rules WHERE id = ?1", [id])?;
         Ok(())
     }
 

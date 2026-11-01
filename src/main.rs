@@ -31,6 +31,7 @@ mod db;
 mod dns;
 mod frontend;
 mod geo;
+mod gost;
 mod mcp;
 mod notify;
 mod ping_alert;
@@ -649,6 +650,9 @@ async fn main() -> Result<()> {
         .route("/api/proxy/relays/import", post(api::import_relays))
         .route("/api/proxy/relays/{id}", put(api::update_relay_rule).delete(api::delete_relay_rule))
         .route("/api/proxy/relays/{id}/diagnose", post(api::diagnose_relay_rule))
+        // gost 转发/隧道（隧道模块）
+        .route("/api/gost", get(api::gost_list).post(api::create_gost_rule))
+        .route("/api/gost/{id}", put(api::update_gost_rule).delete(api::delete_gost_rule))
         // 订阅转换 v2（miaomiaowu 架构：模板注入 + 标签制 + 规则片段）。
         .route("/api/conv/nodes", get(subscription::conv_nodes_list))
         .route("/api/conv/nodes/import", post(subscription::conv_nodes_import))

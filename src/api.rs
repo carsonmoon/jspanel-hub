@@ -4442,6 +4442,89 @@ pub async fn delete_relay_rule(_: Admin, State(app): State<Shared>, Path(id): Pa
     }
 }
 
+// ---- gost 转发/隧道（隧道模块）----
+
+pub async fn gost_list(_: Admin, State(app): State<Shared>) -> Response {
+    let rules = match app.db.gost_rules() {
+        Ok(r) => r,
+        Err(e) => return fail(e),
+    };
+    let rules: Vec<Value> = rules
+        .iter()
+        .map(|r| {
+            let mut v = serde_json::to_value(r).unwrap_or(json!({}));
+            v["mode"] = json!(if r.exit_server_id > 0 { "tunnel" } else { "forward" });
+            v
+        })
+        .collect();
+    let port_pool = app.db.get("proxy_port_pool").unwrap_or_else(|| "20000-50000".into());
+    Json(json!({ "rules": rules, "port_pool": port_pool, "gost_version": crate::gost::GOST_VERSION }))
+        .into_response()
+}
+
+pub async fn create_gost_rule(
+    _: Admin,
+    State(app): State<Shared>,
+    body: Result<Json<crate::db::GostRule>, JsonRejection>,
+) -> Response {
+    let Json(mut rule) = match body {
+        Ok(b) => b,
+        Err(_) => return bad("请求格式不对"),
+    };
+    rule.id = 0;
+    if let Err(e) = crate::gost::prepare_and_validate(&app, &mut rule, 0) {
+        return fail(e);
+    }
+    let id = match app.db.create_gost_rule(&rule) {
+        Ok(i) => i,
+        Err(e) => return fail(e),
+    };
+    rule.id = id;
+    // 推送失败不回滚：心跳对账每拍重试（与 relay 同款最终一致语义）。
+    crate::gost::apply_rule(&app, &rule).await;
+    Json(json!({ "id": id })).into_response()
+}
+
+pub async fn update_gost_rule(
+    _: Admin,
+    State(app): State<Shared>,
+    Path(id): Path<i64>,
+    body: Result<Json<crate::db::GostRule>, JsonRejection>,
+) -> Response {
+    let Json(mut rule) = match body {
+        Ok(b) => b,
+        Err(_) => return bad("请求格式不对"),
+    };
+    if app.db.gost_rule(id).ok().flatten().is_none() {
+        return bad("隧道规则不存在，可能已被删除");
+    }
+    rule.id = id;
+    if let Err(e) = crate::gost::prepare_and_validate(&app, &mut rule, id) {
+        return fail(e);
+    }
+    if let Err(e) = app.db.update_gost_rule(&rule) {
+        return fail(e);
+    }
+    // 入口/出口机换过时旧机器靠心跳对账收敛成空期望（与 relay 同款）。
+    crate::gost::apply_rule(&app, &rule).await;
+    Json(json!({ "ok": true })).into_response()
+}
+
+pub async fn delete_gost_rule(_: Admin, State(app): State<Shared>, Path(id): Path<i64>) -> Response {
+    let Some(rule) = app.db.gost_rule(id).ok().flatten() else {
+        return bad("隧道规则不存在，可能已被删除");
+    };
+    if let Err(e) = app.db.delete_gost_rule(id) {
+        return fail(e);
+    }
+    // 删除后两侧期望为空 → 推空让 agent 停服务清文件。
+    crate::gost::apply_gost_after_change(&app, rule.server_id).await;
+    if rule.exit_server_id > 0 && rule.exit_server_id != rule.server_id {
+        crate::gost::apply_gost_after_change(&app, rule.exit_server_id).await;
+    }
+    Json(json!({ "ok": true })).into_response()
+}
+
 /// 隧道诊断（对齐用户参考图）：每腿 10 次 TCP connect（200ms 间隔），聚合平均
 /// 延迟与丢包率并分级。纯检测——健康检查已移除，诊断不回写任何状态。
 pub async fn diagnose_relay_rule(_: Admin, State(app): State<Shared>, Path(id): Path<i64>) -> Response {

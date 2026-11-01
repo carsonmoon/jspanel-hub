@@ -259,6 +259,7 @@ fn allocate_port(app: &App, server_id: i64) -> Result<i64> {
     let pool = app.db.get("proxy_port_pool").unwrap_or_else(|| "20000-50000".into());
     let mut used: HashSet<i64> = used_ports_on(app, server_id)?.into_iter().collect();
     used.extend(relay_ports_on(app, server_id)?);
+    used.extend(crate::gost::gost_ports_on(app, server_id)?);
     choose_free_port(&pool, &used)
 }
 
@@ -271,6 +272,7 @@ fn allocate_cdn_port(app: &App, server_id: i64, protocol: &str) -> Result<i64> {
     let pool = cdn_port_pool(protocol);
     let mut used: HashSet<i64> = used_ports_on(app, server_id)?.into_iter().collect();
     used.extend(relay_ports_on(app, server_id)?);
+    used.extend(crate::gost::gost_ports_on(app, server_id)?);
     pool.iter().copied().find(|p| !used.contains(p)).ok_or_else(|| {
         anyhow::Error::msg(crate::Shown(format!(
             "该主机的 Cloudflare 回源端口（{}）已全部被占用，无法再建 CDN 中转",
@@ -456,7 +458,7 @@ pub fn node_server_ids(n: &crate::db::ProxyNode) -> Vec<i64> {
 /// 端口占用互查的身份范围：server_id=0（本机核心）与 hostname 等于 hub 的
 /// 「主」节点行指同一台物理机，两套身份共用一个端口空间——协议/中转谁挂
 /// 在哪套身份上，占用检查都必须互通（hub+agent 同机部署形态）。
-fn port_scopes(app: &App, server_id: i64) -> Vec<i64> {
+pub(crate) fn port_scopes(app: &App, server_id: i64) -> Vec<i64> {
     let mut scopes = vec![server_id];
     if let Some(local) = local_node_server_id(app) {
         if server_id == 0 && !scopes.contains(&local) {
@@ -2112,6 +2114,7 @@ pub fn allocate_relay_port(app: &App, server_id: i64) -> Result<i64> {
     let _ = (lo, hi); // 池边界由 choose_free_port 统一解析与报错
     let mut used: HashSet<i64> = proxy_used_ports_scoped(app, server_id)?.into_iter().collect();
     used.extend(relay_ports_on(app, server_id)?);
+    used.extend(crate::gost::gost_ports_on(app, server_id)?);
     // 与协议侧同款：池内随机取空闲端口（此前是 find 取第一个空闲，顺序可预测）。
     choose_free_port(&pool, &used)
 }
@@ -3571,6 +3574,8 @@ pub struct RemoteState {
     pub installed: bool,
     /// agent 是否已装 Realm（M5）。
     pub realm_installed: bool,
+    /// agent 是否已装 gost（隧道模块）。
+    pub gost_installed: bool,
     /// 最近一次见到的 sing-box 版本（版本过旧黄条，二期）：hub 只在已有的
     /// 触点（状态查询/安装/补装）缓存，没触点过的机器版本未知=不出黄条。
     pub version: String,
@@ -3882,6 +3887,7 @@ pub async fn on_agent_hash_ext(
     server_id: i64,
     reported: &str,
     relay_reported: Option<&str>,
+    gost_reported: Option<&str>,
     version: Option<&str>,
 ) -> Result<()> {
     {
@@ -3937,6 +3943,29 @@ pub async fn on_agent_hash_ext(
                     // 数周无人知）——坏着时每 60s 一条正是该吵的时候；成功静默。
                     warn!("node {server_id}: relay ensure-started poke failed: {e:#}");
                 }
+            }
+        }
+    }
+    // gost 对账（隧道模块）：与 relay 同款语义——期望来自 gost_expected（与
+    // 推送同源），不一致重推；一致且期望非空 → 每拍 poke 确保拉起（agent
+    // 侧 is-active 幂等兜着）。旧 agent 不带 gost_hash → None 跳过。
+    if let Some(gost_hash) = gost_reported {
+        let (_, want) = crate::gost::gost_expected(app, server_id)?;
+        let desired_running = !want.is_empty();
+        if want != gost_hash {
+            let pushed = crate::gost::reconcile_gost_push(app, server_id)?;
+            eprintln!("[hash] gost reconcile: want={want:?} got={gost_hash:?} pushed={pushed}");
+        } else if desired_running && server_id != 0 {
+            if let Err(e) = crate::agent_ws::call_agent(
+                app,
+                server_id,
+                "gost.ensure_started",
+                serde_json::json!({}),
+                Duration::from_secs(1),
+            )
+            .await
+            {
+                warn!("node {server_id}: gost ensure-started poke failed: {e:#}");
             }
         }
     }
@@ -4881,7 +4910,7 @@ mod relay_render_tests {
         });
 
         // 真实心跳形状：relay_hash 恒在（无配置时空串）。
-        on_agent_hash_ext(&app, 2, "stale-singbox-hash", Some(""), Some("1.14.2")).await.unwrap();
+        on_agent_hash_ext(&app, 2, "stale-singbox-hash", Some(""), None, Some("1.14.2")).await.unwrap();
 
         // relay.apply 已推给机器 2（fire-and-forget,等桩消费到再断言）。
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
@@ -4945,7 +4974,7 @@ mod relay_render_tests {
         // 消费帧，桩的状态更新才发生在下一拍之前。
         for _ in 0..3 {
             let hash = reported.lock().unwrap().clone();
-            on_agent_hash_ext(&app, 2, "", Some(&hash), None).await.unwrap();
+            on_agent_hash_ext(&app, 2, "", Some(&hash), None, None).await.unwrap();
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         }
 
@@ -4999,7 +5028,7 @@ mod relay_render_tests {
         // 上报指纹与期望完全一致（收敛）：唯一该发生的动作就是拉活 poke。
         let (_, want) = relay_expected(&app, 2).unwrap();
         assert!(!want.is_empty(), "机器 2 有备用腿，期望指纹非空");
-        on_agent_hash_ext(&app, 2, "", Some(&want), None).await.unwrap();
+        on_agent_hash_ext(&app, 2, "", Some(&want), None, None).await.unwrap();
 
         // poke 走 call_agent 等应答，函数返回时帧必已被桩消费并记账。
         let got = pokes.lock().unwrap();
