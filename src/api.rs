@@ -1605,21 +1605,8 @@ const RELEASES_RETRY: i64 = 600;
 /// never opened makes no outbound request.
 pub async fn versions(_: Admin, State(app): State<Shared>) -> Json<Value> {
     let cached = app.releases.lock().unwrap().clone();
-    let latest = if fresh_enough(&cached, Utc::now().timestamp()) {
-        cached
-    } else {
-        // Both at once: one round trip of latency rather than two, and neither
-        // lookup depends on the other.
-        let (hub, agent) =
-            tokio::join!(latest_tag(&app, crate::HUB_REPO), latest_tag(&app, crate::AGENT_REPO));
-        let read = crate::Releases {
-            read_at: Utc::now().timestamp(),
-            hub: hub.unwrap_or_default(),
-            agent: agent.unwrap_or_default(),
-        };
-        *app.releases.lock().unwrap() = read.clone();
-        read
-    };
+    let latest =
+        if fresh_enough(&cached, Utc::now().timestamp()) { cached } else { refresh_releases(&app).await };
     Json(json!({
         "hub": env!("CARGO_PKG_VERSION"),
         // Empty where GitHub could not be reached, which the panel renders as no
@@ -1634,6 +1621,34 @@ pub async fn versions(_: Admin, State(app): State<Shared>) -> Json<Value> {
         // lookup runs either way, so the update page still answers when opened.
         "notice": app.db.get("update_notice").as_deref() != Some("off"),
     }))
+}
+
+/// Re-reads both own repos' latest tags into the shared releases cache. Both at
+/// once: one round trip of latency rather than two, and neither lookup depends
+/// on the other.
+async fn refresh_releases(app: &App) -> crate::Releases {
+    let (hub, agent) = tokio::join!(latest_tag(app, crate::HUB_REPO), latest_tag(app, crate::AGENT_REPO));
+    let read = crate::Releases {
+        read_at: Utc::now().timestamp(),
+        hub: hub.unwrap_or_default(),
+        agent: agent.unwrap_or_default(),
+    };
+    *app.releases.lock().unwrap() = read.clone();
+    read
+}
+
+/// The agent release tag the binary relay serves, `v` included. The relay takes
+/// anonymous requests, so it shares the update page's cache and its TTL rather
+/// than spending a GitHub call per download; a fresh-but-empty cache keeps the
+/// [`RELEASES_RETRY`] window (a GitHub moment of unreachability must not turn
+/// every install into a stampede of list calls).
+pub async fn agent_release_tag(app: &App) -> Option<String> {
+    let cached = app.releases.lock().unwrap().clone();
+    if fresh_enough(&cached, Utc::now().timestamp()) {
+        return (!cached.agent.is_empty()).then(|| format!("v{}", cached.agent));
+    }
+    let read = refresh_releases(app).await;
+    (!read.agent.is_empty()).then(|| format!("v{}", read.agent))
 }
 
 /// 覆盖存在的架构列表（空 = 无覆盖，装机走 Release）。两个 stat，不缓存。
@@ -1660,16 +1675,45 @@ fn fresh_enough(cached: &crate::Releases, now: i64) -> bool {
     cached.read_at != 0 && now - cached.read_at < holds
 }
 
-/// The tag of a repository's latest release, without its leading `v`, or None
-/// where GitHub could not be read, which costs only the update notice.
+/// The tag of a repository's latest v-prefixed release, without its leading `v`,
+/// or None where GitHub could not be read, which costs only the update notice.
+/// Both own repos tag their releases `v*` while also carrying others the panel
+/// must not mistake for builds: the agent repo publishes `realm-api-v*`
+/// releases with no agent binary, and GitHub's releases/latest answers the
+/// newest release regardless — the relay 404s and the update notice compares
+/// against a realm version.
 async fn latest_tag(app: &App, repo: &str) -> Option<String> {
-    let tag = latest_release(app, repo).await.ok()?.tag_name;
+    let tag = latest_v_release(app, repo).await?.tag_name;
     Some(tag.strip_prefix('v').unwrap_or(&tag).to_owned())
 }
 
-/// The latest release of `owner/repo`. Unauthenticated: 60 requests per hour from
-/// this address. GitHub returns 403 without a User-Agent. Never through the
-/// panel's GitHub proxy, which most mirrors provide for release downloads alone.
+/// The newest release of `owner/repo` whose tag starts with `v`, from the list
+/// endpoint that GitHub orders newest first. Unauthenticated like
+/// [`latest_release`]: 60 requests per hour from this address. Never through
+/// the panel's GitHub proxy, which most mirrors provide for release downloads
+/// alone.
+async fn latest_v_release(app: &App, repo: &str) -> Option<Release> {
+    let releases: Vec<Release> = app
+        .http
+        .get(format!("https://api.github.com/repos/{repo}/releases?per_page=100"))
+        .header(header::USER_AGENT, "monitor-hub")
+        .send()
+        .await
+        .ok()?
+        .error_for_status()
+        .ok()?
+        .json()
+        .await
+        .ok()?;
+    releases.into_iter().find(|r| r.tag_name.starts_with('v'))
+}
+
+/// The latest release of `owner/repo`. Theme repositories only: the own repos'
+/// update notice and the agent relay go through [`latest_v_release`], since
+/// GitHub's releases/latest cannot be told a `realm-api-v*` release apart from
+/// an agent build. Unauthenticated: 60 requests per hour from this address.
+/// GitHub returns 403 without a User-Agent. Never through the panel's GitHub
+/// proxy, which most mirrors provide for release downloads alone.
 async fn latest_release(app: &App, repo: &str) -> reqwest::Result<Release> {
     app.http
         .get(format!("https://api.github.com/repos/{repo}/releases/latest"))

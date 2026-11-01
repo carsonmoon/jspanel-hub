@@ -1112,21 +1112,25 @@ function registerCommand(site: string, key: string, seconds: number | undefined,
   return scriptCommand(site, (s) => [`--server ${s}`, `--register ${key}`, ...intervalArg(seconds), ...ifaceArg(iface), ...core])
 }
 
-// The two proxy-core flags both install dialogs append. sing-box installs by
+// The three proxy-core flags both install dialogs append. sing-box installs by
 // default (its unchecked form is the explicit --no-singbox), pinned to the
-// settings' global default unless the field is emptied for latest; realm is
-// opt-in — the agent auto-installs it when the first relay rule needs it.
-function coreArgs(sb: ReturnType<typeof useSingboxOption>, realm: ReturnType<typeof useRealmOption>) {
+// settings' global default unless the field is emptied for latest; realm and
+// gost are opt-in — the agent auto-installs each when the first relay/tunnel
+// rule needs it. Neither takes a version flag: the fork build (realm) and the
+// agent's pinned gost are the only versions that survive the agent's checks.
+function coreArgs(
+  sb: ReturnType<typeof useSingboxOption>,
+  realm: ReturnType<typeof useRealmOption>,
+  gost: ReturnType<typeof useGostOption>,
+) {
   const args: string[] = []
   if (sb.on) {
     if (sb.version) args.push(`--singbox-version ${sb.version}`)
   } else {
     args.push("--no-singbox")
   }
-  if (realm.on) {
-    args.push("--with-realm")
-    if (realm.version) args.push(`--realm-version ${realm.version}`)
-  }
+  if (realm.on) args.push("--with-realm")
+  if (gost.on) args.push("--with-gost")
   return args
 }
 
@@ -1209,8 +1213,9 @@ function RegisterDialog({ site, reg, onClose }: {
     const settings = useSettings().s
   const sbDefault = typeof settings?.singbox_default_version === "string" ? settings.singbox_default_version : undefined
   const sb = useSingboxOption(sbDefault)
-  const realm = useRealmOption(typeof settings?.realm_default_version === "string" ? settings.realm_default_version : undefined)
-  const command = reg.left > 0 && iface.valid && sb.valid ? registerCommand(site, reg.key, interval.flag, iface.flag, coreArgs(sb, realm)) : ""
+  const realm = useRealmOption()
+  const gost = useGostOption()
+  const command = reg.left > 0 && iface.valid && sb.valid ? registerCommand(site, reg.key, interval.flag, iface.flag, coreArgs(sb, realm, gost)) : ""
   const clock = `${Math.floor(reg.left / 60)}:${String(reg.left % 60).padStart(2, "0")}`
 
   return (
@@ -1231,6 +1236,7 @@ function RegisterDialog({ site, reg, onClose }: {
             <IfaceOption option={iface} batch />
             <SingboxOption option={sb} />
             <RealmOption option={realm} />
+            <GostOption option={gost} />
           </section>
           {reg.left > 0 ? (
             <section className="space-y-2 border-t pt-5">
@@ -1380,57 +1386,42 @@ function SingboxOption({ option }: { option: ReturnType<typeof useSingboxOption>
   )
 }
 
-// realm 安装选项：默认不装（装机多下一份二进制，中转机才用得上）；勾上后
-// install.sh 只下载二进制，systemd 单元由 agent 在第一份中转配置推送时自写。
-function useRealmOption(defaultVersion: string | undefined) {
+// realm 安装选项：默认不装（装机多下一份二进制，中转机才用得上）。勾上预装
+// fork API 构建——版本唯一事实源是节点程序的钉死常量，apply 前自检会纠正任何
+// 漂移，所以没有版本输入。install.sh 只下载二进制，monitor-realm-api 单元由
+// agent 在第一份中转配置推送时自写。
+function useRealmOption() {
   const [on, setOn] = useState(false)
-  const [typed, setTyped] = useState<string>()
-  const value = (typed !== undefined ? typed : (defaultVersion ?? "")).trim()
-  return { on, setOn, typed, setTyped, defaultVersion, version: value || undefined }
+  return { on, setOn }
 }
 
 function RealmOption({ option }: { option: ReturnType<typeof useRealmOption> }) {
-  const { on, setOn, typed, setTyped, defaultVersion } = option
+  const { on, setOn } = option
   return (
     <OptionRow
       title="安装 realm 核心"
-      hint="转发出口的载体。不装也能用：首次建转发规则时 agent 自动补装（用设置页的全局默认版本）；勾上适合网络不便访问 GitHub 的机器"
+      hint="预装转发核心（fork API 构建，版本与节点程序钉死版本一致）。不装也能用：首次建转发规则时自动补装；勾上适合网络不便访问 GitHub 的机器"
       toggle
-      below={on && (
-        <Field label="realm 版本" hint="留空 = 最新版；全局默认已在设置页，可在此临时覆盖">
-          <div className="flex flex-col gap-2">
-            <Input
-              value={typed ?? ""}
-              onChange={(e) => setTyped(e.target.value.replace(/[^0-9.]/g, ""))}
-              placeholder={`默认 ${defaultVersion || "最新版"}，留空 = 最新`}
-              spellCheck={false}
-              className="font-mono text-xs"
-            />
-            <div className="flex flex-wrap gap-1.5">
-              <button
-                type="button"
-                onClick={() => setTyped("")}
-                className={`rounded-md border px-2 py-1 text-xs transition-colors ${
-                  typed === "" ? "border-foreground bg-secondary font-medium" : "text-muted-foreground hover:bg-muted"
-                }`}
-              >
-                最新版
-              </button>
-              {defaultVersion && (
-                <button
-                  type="button"
-                  onClick={() => setTyped(undefined)}
-                  className={`rounded-md border px-2 py-1 text-xs transition-colors ${
-                    typed === undefined ? "border-foreground bg-secondary font-medium" : "text-muted-foreground hover:bg-muted"
-                  }`}
-                >
-                  默认 {defaultVersion}
-                </button>
-              )}
-            </div>
-          </div>
-        </Field>
-      )}
+    >
+      <Switch checked={on} onCheckedChange={setOn} />
+    </OptionRow>
+  )
+}
+
+// gost 安装选项：与 realm 同款形状、无版本输入——gost.apply 不自检版本，
+// 预装漂移不会被纠正，版本钉死在脚本里。
+function useGostOption() {
+  const [on, setOn] = useState(false)
+  return { on, setOn }
+}
+
+function GostOption({ option }: { option: ReturnType<typeof useGostOption> }) {
+  const { on, setOn } = option
+  return (
+    <OptionRow
+      title="安装 gost 核心"
+      hint="预装隧道核心（版本与节点程序钉死版本一致）。不装也能用：首次建隧道规则时自动补装；勾上适合网络不便访问 GitHub 的机器"
+      toggle
     >
       <Switch checked={on} onCheckedChange={setOn} />
     </OptionRow>
@@ -1498,9 +1489,10 @@ function InstallDialog({ node, site, onClose, onRotated }: {
     const settings = useSettings().s
   const sbDefault = typeof settings?.singbox_default_version === "string" ? settings.singbox_default_version : undefined
   const sb = useSingboxOption(sbDefault)
-  const realm = useRealmOption(typeof settings?.realm_default_version === "string" ? settings.realm_default_version : undefined)
+  const realm = useRealmOption()
+  const gost = useGostOption()
 
-  const command = token && iface.valid && sb.valid ? installCommand(site, token, interval.flag, iface.flag, coreArgs(sb, realm)) : ""
+  const command = token && iface.valid && sb.valid ? installCommand(site, token, interval.flag, iface.flag, coreArgs(sb, realm, gost)) : ""
 
   async function rotate() {
     setRotating(true)
@@ -1533,6 +1525,7 @@ function InstallDialog({ node, site, onClose, onRotated }: {
             <IfaceOption option={iface} />
             <SingboxOption option={sb} />
             <RealmOption option={realm} />
+            <GostOption option={gost} />
           </section>
           <section className="space-y-2 border-t pt-5">
             <h3 className="text-sm font-semibold">安装命令</h3>

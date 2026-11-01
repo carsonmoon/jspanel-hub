@@ -218,14 +218,20 @@ async fn tls_script() -> Response {
 /// command: a hub that cannot reach github.com cannot relay to any node, so the
 /// answer is the same for all of them.
 ///
+/// The tag is pinned by the caller (`api::agent_release_tag`) rather than
+/// `releases/latest/download`: the agent repo also carries `realm-api-v*`
+/// releases with no agent binary, and latest answers the newest of those —
+/// every install 404'd once one shipped (2026-11-02, caught by the install
+/// E2E).
+///
 /// This URL is fetched on an anonymous request, so setting it redirects that
 /// path. It remains within the bounds `agent_binary` already enforces: four
 /// concurrent transfers, a 120-second timeout, and a streamed body.
-fn release_url(app: &App, arch: &str) -> String {
+fn release_url(app: &App, arch: &str, tag: &str) -> String {
     proxied(
         app,
         format!(
-            "https://github.com/{AGENT_REPO}/releases/latest/download/monitor-agent-{arch}-unknown-linux-musl"
+            "https://github.com/{AGENT_REPO}/releases/download/{tag}/monitor-agent-{arch}-unknown-linux-musl"
         ),
     )
 }
@@ -358,7 +364,13 @@ async fn agent_binary(State(app): State<Shared>, Path(arch): Path<String>) -> Re
     let Ok(Ok(permit)) = tokio::time::timeout(RELAY_WAIT, RELAY_GATE.acquire()).await else {
         return api::answer(StatusCode::SERVICE_UNAVAILABLE, "too many downloads in flight, try again");
     };
-    let url = release_url(&app, &arch);
+    let Some(tag) = api::agent_release_tag(&app).await else {
+        return api::answer(
+            StatusCode::BAD_GATEWAY,
+            "the hub could not read the agent release list from GitHub; its log has the details",
+        );
+    };
+    let url = release_url(&app, &arch, &tag);
     // The default client timeout is sized for API calls, not a 1.8 MB download.
     let fetched = app.http.get(&url).timeout(std::time::Duration::from_secs(120)).send().await;
     match fetched {
@@ -1248,17 +1260,24 @@ mod tests {
     #[test]
     fn a_github_proxy_prefixes_the_release_url_and_an_empty_one_does_not() {
         let app = app("");
-        let direct = release_url(&app, "x86_64");
-        assert!(direct.starts_with("https://github.com/carsonmoon/jspanel-agent/releases/"), "{direct}");
+        let direct = release_url(&app, "x86_64", "v1.2.0");
+        assert!(
+            direct.starts_with("https://github.com/carsonmoon/jspanel-agent/releases/download/v1.2.0/"),
+            "{direct}"
+        );
 
         for set in ["https://ghfast.top", "https://ghfast.top/", "  https://ghfast.top/  "] {
             app.db.set("github_proxy", set).unwrap();
-            assert_eq!(release_url(&app, "x86_64"), format!("https://ghfast.top/{direct}"), "{set:?}");
+            assert_eq!(
+                release_url(&app, "x86_64", "v1.2.0"),
+                format!("https://ghfast.top/{direct}"),
+                "{set:?}"
+            );
         }
         // Cleared in the panel, which stores an empty string rather than removing
         // the row.
         app.db.set("github_proxy", "").unwrap();
-        assert_eq!(release_url(&app, "x86_64"), direct);
+        assert_eq!(release_url(&app, "x86_64", "v1.2.0"), direct);
     }
 
     #[test]

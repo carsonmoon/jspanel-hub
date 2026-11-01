@@ -26,9 +26,10 @@ SB_VERSION=""
 SUB_PORT=""
 SUB_PORT_SET=0
 # 中转核心（M5）：realm 不随装机默认安装——中转机第一次建中转规则时 agent
-# 会自动补装（relay.install）。--with-realm 给网络差、想提前装好的机器。
+# 会自动补装（apply 前版本自检）。--with-realm 给网络差、想提前装好的机器。
+# 隧道核心同理：gost 从不随装机安装，--with-gost 预装。
 REALM=0
-REALM_VERSION=""
+GOST=0
 REGISTER=""
 NAME=""
 IFACE=""
@@ -50,7 +51,7 @@ while [ $# -gt 0 ]; do
 	--no-singbox) SINGBOX=0; shift ;;
 	--singbox-version) SB_VERSION="$2"; shift 2 ;;
 	--with-realm) REALM=1; shift ;;
-	--realm-version) REALM_VERSION="$2"; shift 2 ;;
+	--with-gost) GOST=1; shift ;;
 	--token) TOKEN="$2"; shift 2 ;;
 	--register) REGISTER="$2"; shift 2 ;;
 	--name) NAME="$2"; shift 2 ;;
@@ -100,13 +101,14 @@ if [ -n "$UPGRADE" ]; then
 		echo "install it with the command from the panel instead" >&2
 		exit 2
 	}
-	# 升级只换 agent 本体：机器上没有的组件（sing-box/realm）不该被顺带装上。
+	# 升级只换 agent 本体：机器上没有的组件（sing-box/realm/gost）不该被顺带装上。
 	SINGBOX=0
 	REALM=0
+	GOST=0
 fi
 
 [ -n "$SERVER" ] && { [ -n "$TOKEN" ] || [ -n "$REGISTER" ]; } || {
-	echo "usage: install.sh --server URL (--token TOKEN | --register KEY) [--interval SECONDS] [--iface LIST] [--sub-port PORT] [--insecure] [--no-singbox] [--singbox-version X] [--with-realm] [--realm-version X]" >&2
+	echo "usage: install.sh --server URL (--token TOKEN | --register KEY) [--interval SECONDS] [--iface LIST] [--sub-port PORT] [--insecure] [--no-singbox] [--singbox-version X] [--with-realm] [--with-gost]" >&2
 	echo "       install.sh --upgrade [--iface LIST] [--interval SECONDS] [--sub-port PORT]" >&2
 	echo "       install.sh --uninstall" >&2
 	echo "--name NAME names the node --register creates; the hostname otherwise" >&2
@@ -542,40 +544,66 @@ UNIT
 fi
 
 # ---- realm 核心（中转模块，--with-realm）----
-# 只装二进制：monitor-realm@.service 单元由 agent 在第一份中转配置推送时
-# 自写并启动（relay.apply）。GitHub 不可达不视为失败：建中转规则时 agent
-# 会自动补装（relay.install）。
+# 装 fork API 构建（realm api 单进程实例模型）：版本与 agent 仓 proxy.rs 的
+# REALM_API_VERSION 钉死值同步——不一致时 agent 在第一次 relay.apply 的版本
+# 自检里会自动重装正确版，这里只是提前放置。只装二进制：monitor-realm-api
+# 单元由 agent 在第一份中转配置推送时自写并启动。GitHub 不可达不视为失败：
+# 建中转规则时 agent 会自动补装。
+RL_FORK_VERSION="2.9.8-m1"
 if [ "$REALM" = 1 ]; then
-	RL_VERSION=$(printf %s "$REALM_VERSION" | tr -d 'v')
-	if [ -z "$RL_VERSION" ]; then
-		RL_VERSION=$(curl -sSL --max-time 20 "https://api.github.com/repos/zhboner/realm/releases/latest" | sed -n 's/.*"tag_name": *"v\([^"]*\)".*/\1/p' | head -n 1)
-	fi
-	case "$RL_VERSION" in
-		""|*[!0-9.]*) echo "warning: could not resolve the realm version; skipped (it is installed automatically when the first relay rule is created)" >&2 ;;
-		*)
-			RL_TARGET=""
-			case "$ARCH" in
-				x86_64) RL_TARGET=x86_64-unknown-linux-musl ;;
-				aarch64) RL_TARGET=aarch64-unknown-linux-musl ;;
-			esac
-			if [ -z "$RL_TARGET" ]; then
-				echo "warning: no realm release for $ARCH; skipped" >&2
-			else
-				RL_BIN="/opt/monitor-proxy/bin/realm"
-				RL_TMP="$(mktemp -d)"
-				echo "downloading realm $RL_VERSION ($RL_TARGET)"
-				if curl -sSL --max-time 300 "https://github.com/zhboner/realm/releases/download/v$RL_VERSION/realm-$RL_TARGET.tar.gz" -o "$RL_TMP/realm.tar.gz" &&
-					tar -xzf "$RL_TMP/realm.tar.gz" -C "$RL_TMP" &&
-					[ -f "$RL_TMP/realm" ]; then
-					mkdir -p "/opt/monitor-proxy/bin"
-					install -m 0755 "$RL_TMP/realm" "$RL_BIN"
-					rm -rf "$RL_TMP"
-					echo "realm $RL_VERSION installed; it starts when the first relay rule is pushed"
-				else
-					rm -rf "$RL_TMP"
-					echo "warning: realm download failed; skipped (it is installed automatically when the first relay rule is created)" >&2
-				fi
-			fi
-			;;
+	RL_TARGET=""
+	case "$ARCH" in
+		x86_64) RL_TARGET=x86_64-unknown-linux-musl ;;
+		aarch64) RL_TARGET=aarch64-unknown-linux-musl ;;
 	esac
+	if [ -z "$RL_TARGET" ]; then
+		echo "warning: no realm release for $ARCH; skipped" >&2
+	else
+		RL_BIN="/opt/monitor-proxy/bin/realm"
+		RL_TMP="$(mktemp -d)"
+		echo "downloading realm $RL_FORK_VERSION ($RL_TARGET)"
+		if curl -sSL --max-time 300 "https://github.com/carsonmoon/jspanel-agent/releases/download/realm-api-v$RL_FORK_VERSION/realm-$RL_TARGET.tar.gz" -o "$RL_TMP/realm.tar.gz" &&
+			tar -xzf "$RL_TMP/realm.tar.gz" -C "$RL_TMP" &&
+			[ -f "$RL_TMP/realm" ]; then
+			mkdir -p "/opt/monitor-proxy/bin"
+			install -m 0755 "$RL_TMP/realm" "$RL_BIN"
+			rm -rf "$RL_TMP"
+			echo "realm $RL_FORK_VERSION installed; it starts when the first relay rule is pushed"
+		else
+			rm -rf "$RL_TMP"
+			echo "warning: realm download failed; skipped (it is installed automatically when the first relay rule is created)" >&2
+		fi
+	fi
+fi
+
+# ---- gost 核心（隧道模块，--with-gost）----
+# 版本与 agent 仓 proxy.rs 的 GOST_VERSION 钉死值同步（gost.apply 不自检
+# 版本，预装漂移不会被纠正，故不提供版本参数）。只装二进制：monitor-gost@main
+# 单元由 agent 在第一份隧道配置推送时自写并启动。GitHub 不可达不视为失败：
+# 建隧道规则时 hub 会自动补装（gost.install）。
+GOST_VERSION_PIN="3.3.2"
+if [ "$GOST" = 1 ]; then
+	GO_ARCH=""
+	case "$ARCH" in
+		x86_64) GO_ARCH=amd64 ;;
+		aarch64) GO_ARCH=arm64 ;;
+	esac
+	if [ -z "$GO_ARCH" ]; then
+		echo "warning: no gost release for $ARCH; skipped" >&2
+	else
+		GO_BIN="/opt/monitor-proxy/bin/gost"
+		GO_TMP="$(mktemp -d)"
+		echo "downloading gost $GOST_VERSION_PIN ($GO_ARCH)"
+		if curl -sSL --max-time 300 "https://github.com/go-gost/gost/releases/download/v$GOST_VERSION_PIN/gost_${GOST_VERSION_PIN}_linux_${GO_ARCH}.tar.gz" -o "$GO_TMP/gost.tar.gz" &&
+			tar -xzf "$GO_TMP/gost.tar.gz" -C "$GO_TMP" &&
+			[ -f "$GO_TMP/gost" ]; then
+			mkdir -p "/opt/monitor-proxy/bin"
+			install -m 0755 "$GO_TMP/gost" "$GO_BIN"
+			rm -rf "$GO_TMP"
+			echo "gost $GOST_VERSION_PIN installed; it starts when the first tunnel rule is pushed"
+		else
+			rm -rf "$GO_TMP"
+			echo "warning: gost download failed; skipped (it is installed automatically when the first tunnel rule is created)" >&2
+		fi
+	fi
 fi
