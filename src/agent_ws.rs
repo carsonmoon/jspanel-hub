@@ -584,6 +584,8 @@ fn dispatch(
             // sing-box 版本随心跳捎带（二期）：喂协议页的版本过旧黄条；旧
             // agent 不带此字段，缓存保持原值。
             let version = rpc.params.get("version").and_then(|v| v.as_str()).map(str::to_owned);
+            // 每 relay unit 状态（转发页徽标数据源）；旧 agent 不带 → None。
+            let relay_units = rpc.params.get("relay_units").cloned();
             let app = app.clone();
             tokio::spawn(async move {
                 if let Err(e) = crate::proxy::on_agent_hash_ext(
@@ -593,6 +595,7 @@ fn dispatch(
                     relay_hash.as_deref(),
                     gost_hash.as_deref(),
                     version.as_deref(),
+                    relay_units,
                 )
                 .await
                 {

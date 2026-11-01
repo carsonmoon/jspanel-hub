@@ -26,6 +26,21 @@ const protocolBadge = (p: string) =>
 
 const transportLabel = { tls: "TLS", ws: "WS", wss: "WSS" } as Record<string, string>
 
+/** 每 unit 运行态徽标（心跳 relay_units 捎带）：绿=运行，红=已停，不显示=未知
+ * （agent 离线/老 agent 未上报/规则停用——不猜）。 */
+const UnitDot = ({ ok, label }: { ok?: boolean | null; label: string }) =>
+  ok === undefined || ok === null ? null : (
+    <span
+      className={`inline-flex items-center gap-1 rounded px-1 text-[10px] font-medium ${
+        ok ? "bg-emerald-500/10 text-emerald-600 dark:text-emerald-400" : "bg-red-500/10 text-red-600 dark:text-red-400"
+      }`}
+      title={ok ? `${label}机 unit 运行中` : `${label}机 unit 已停止（心跳对账 60s 内收敛）`}
+    >
+      <span className={`size-1.5 rounded-full ${ok ? "bg-emerald-500" : "bg-red-500"}`} />
+      {label}
+    </span>
+  )
+
 
 // ---- 隧道诊断弹窗（对齐参考图）：每段链路一卡 = 平均延迟/丢包率/连接质量分级 ----
 
@@ -387,6 +402,8 @@ function RelayCard({ rules, servers, realmServers, portPool, reload }: {
                     </Badge>
                   )}
                   {protocolBadge(rule.protocol)}
+                  <UnitDot ok={rule.entry_running} label="入口" />
+                  {rule.exit_server_id > 0 && <UnitDot ok={rule.exit_running} label="出口" />}
                 </div>
                 {rule.note && <div className="text-xs text-muted-foreground">{rule.note}</div>}
               </TableCell>

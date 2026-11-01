@@ -2246,8 +2246,10 @@ pub fn effective_targets(targets: &[crate::db::RelayTarget], balance: &str) -> V
     enabled
 }
 
-/// 渲染一台机器 realm.toml 的全部端点行。三类：
-/// - 入口半边：server_id 归属的启用规则（普通转发或多落地）；
+/// 一台机器上每条规则的端点片段：(rule_id, 片段 toml 文本)。同一规则的
+/// 入口半边与出口半边同机时合并进同一片（一个 unit 承载两个端点）；空
+/// 返回 = 本机无腿。渲染三类（与旧整份渲染同一套过滤）：
+/// - 入口半边：server_id 归属（或 entry_backups 备用）的启用规则；
 /// - 隧道入口半边：隧道规则在本机的一侧（remote 指向落地机的加密监听）；
 /// - 出口半边：落地在本机的隧道规则的落地侧（解密后转给真实目标）。
 ///
@@ -2256,11 +2258,10 @@ pub fn effective_targets(targets: &[crate::db::RelayTarget], balance: &str) -> V
 /// 「主」节点行的规则同住一份 realm.toml，必须合并渲染、单点写入——此前
 /// 每身份各渲染各的，后写的把先写的端点整块抹掉。纯远程机器 scopes 只有
 /// 自己一个，行为与旧的按身份渲染完全一致。
-pub fn render_relay_for_machine(app: &App, server_id: i64) -> Result<Option<(String, String)>> {
+fn relay_fragments_for_machine(app: &App, server_id: i64) -> Result<Vec<(i64, String)>> {
     let rules: Vec<_> = app.db.relay_rules()?;
     let all_targets = app.db.relay_targets()?;
     let scopes = port_scopes(app, server_id);
-    let mut eps = String::new();
 
     let entry: Vec<_> = rules
         .iter()
@@ -2283,7 +2284,7 @@ pub fn render_relay_for_machine(app: &App, server_id: i64) -> Result<Option<(Str
                 exits.len()
             );
         }
-        return Ok(None);
+        return Ok(vec![]);
     }
 
     let targets_of = |rule_id: i64| -> Vec<crate::db::RelayTarget> {
@@ -2299,7 +2300,21 @@ pub fn render_relay_for_machine(app: &App, server_id: i64) -> Result<Option<(Str
         }
     };
 
+    let mut out: Vec<(i64, String)> = Vec::new();
+    let mut emit = |id: i64, frag: String| {
+        if frag.is_empty() {
+            return;
+        }
+        // 同规则的另一半：追加进已有片段（同一 unit 的第二个端点）。
+        if let Some((_, existing)) = out.iter_mut().find(|(fid, _)| *fid == id) {
+            existing.push_str(&frag);
+        } else {
+            out.push((id, frag));
+        }
+    };
+
     for r in &entry {
+        let mut frag = String::new();
         let targets = effective_targets(&targets_of(r.id), &r.balance);
         // 隧道入口：remote 是落地机的加密监听，不是业务目标本身。
         let remote: String = if r.exit_server_id > 0 {
@@ -2317,7 +2332,7 @@ pub fn render_relay_for_machine(app: &App, server_id: i64) -> Result<Option<(Str
             }
             r.target.trim().to_owned()
         };
-        eps.push_str(&format!(
+        frag.push_str(&format!(
             "\n[[endpoints]]\nlisten = {}\nremote = {}\n",
             toml_str(&format!("{}:{}", listen_host_of(r), r.listen_port)),
             toml_str(&remote),
@@ -2326,10 +2341,10 @@ pub fn render_relay_for_machine(app: &App, server_id: i64) -> Result<Option<(Str
         if r.exit_server_id == 0 && targets.len() > 1 {
             let extra: Vec<String> =
                 targets[1..].iter().map(|t| toml_str(&format!("{}:{}", t.host, t.port))).collect();
-            eps.push_str(&format!("extra_remotes = [{}]\n", extra.join(", ")));
+            frag.push_str(&format!("extra_remotes = [{}]\n", extra.join(", ")));
             if !r.balance.is_empty() {
                 let weights: Vec<String> = targets.iter().map(|t| format!("{}", t.weight.max(1))).collect();
-                eps.push_str(&format!(
+                frag.push_str(&format!(
                     "balance = {}\n",
                     toml_str(&format!("{}: {}", r.balance, weights.join(", ")))
                 ));
@@ -2337,15 +2352,16 @@ pub fn render_relay_for_machine(app: &App, server_id: i64) -> Result<Option<(Str
         }
         // 隧道入口半边：出方向套加密层（出口侧 servername 自签，入口必须 insecure）。
         if r.exit_server_id > 0 && !r.transport.is_empty() {
-            eps.push_str(&format!(
+            frag.push_str(&format!(
                 "remote_transport = {}\n",
                 toml_str(&transport_str(r, TransportSide::Entry, &tunnel_host(r.exit_server_id)))
             ));
             if r.send_proxy {
-                eps.push_str("send_proxy = true\n");
+                frag.push_str("send_proxy = true\n");
             }
         }
-        eps.push_str(&network_overrides(r));
+        frag.push_str(&network_overrides(r));
+        emit(r.id, frag);
     }
 
     for r in &exits {
@@ -2369,7 +2385,8 @@ pub fn render_relay_for_machine(app: &App, server_id: i64) -> Result<Option<(Str
         if dbg {
             eprintln!("[relay-debug] exit rule {} (id {}) renders {} -> {}", r.name, r.id, port, first.host);
         }
-        eps.push_str(&format!(
+        let mut frag = String::new();
+        frag.push_str(&format!(
             "\n[[endpoints]]\nlisten = {}\nremote = {}\n",
             toml_str(&format!("0.0.0.0:{port}")),
             toml_str(&format!("{}:{}", first.host, first.port))
@@ -2377,25 +2394,75 @@ pub fn render_relay_for_machine(app: &App, server_id: i64) -> Result<Option<(Str
         // 隧道出口半边：入方向解密（servername 模式自签证书，无需证书管理）；
         // 入口开了 proxy protocol 就要对端接收。
         if !r.transport.is_empty() {
-            eps.push_str(&format!(
+            frag.push_str(&format!(
                 "listen_transport = {}\n",
                 toml_str(&transport_str(r, TransportSide::Exit, &tunnel_host(r.exit_server_id)))
             ));
             if r.send_proxy {
-                eps.push_str("accept_proxy = true\n");
+                frag.push_str("accept_proxy = true\n");
             }
         }
-        eps.push_str(&network_overrides(r));
+        frag.push_str(&network_overrides(r));
+        emit(r.id, frag);
     }
 
-    if eps.is_empty() {
-        if std::env::var("MONITOR_RELAY_DEBUG").as_deref() == Ok("1") {
-            eprintln!("[relay-debug] render({server_id}) eps empty after loops");
-        }
+    if out.is_empty() && std::env::var("MONITOR_RELAY_DEBUG").as_deref() == Ok("1") {
+        eprintln!("[relay-debug] render({server_id}) eps empty after loops");
+    }
+    Ok(out)
+}
+
+/// 旧整份渲染（本机直连路径 apply_relay_local 专用；agent 面已改信封逐
+/// unit）。全部规则的端点合并一份 realm.toml，交给 monitor-realm@main。
+pub fn render_relay_for_machine(app: &App, server_id: i64) -> Result<Option<(String, String)>> {
+    let frags = relay_fragments_for_machine(app, server_id)?;
+    if frags.is_empty() {
         return Ok(None);
+    }
+    let mut eps = String::new();
+    for (_, frag) in &frags {
+        eps.push_str(frag);
     }
     let body = format!("[network]\nno_tcp = false\nuse_udp = true\n{eps}");
     Ok(Some((body.clone(), hex::encode(Sha256::digest(body.as_bytes())))))
+}
+
+/// 信封里的一个 unit：一台机器上一条规则的独立 realm 配置。每 unit 一个
+/// systemd 单元（monitor-realm@<id>，id=规则 id）与一份 realm.toml——
+/// 改/停/删单条规则只动它的 unit，其他规则的已建连接不受牵连。
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct RelayUnit {
+    pub id: String,
+    pub config: String,
+    pub sha256: String,
+}
+
+/// 每规则独立 unit 的完整配置（relay.apply 信封 units 的来源）。
+pub fn render_relay_units(app: &App, server_id: i64) -> Result<Vec<RelayUnit>> {
+    Ok(relay_fragments_for_machine(app, server_id)?
+        .into_iter()
+        .map(|(id, frag)| {
+            let config = format!("[network]\nno_tcp = false\nuse_udp = true\n{frag}");
+            let sha256 = hex::encode(Sha256::digest(config.as_bytes()));
+            RelayUnit { id: id.to_string(), config, sha256 }
+        })
+        .collect())
+}
+
+/// 机器级聚合指纹：unit 按 id 升序，拼接 "id\nsha256\n" 后取 sha256。
+/// 空清单 = sha256("")。与 agent 侧（monitor-agent/src/proxy.rs
+/// units_aggregate）逐字同口径——改这里必须同步改那边，golden 测试会拦。
+pub fn units_aggregate(units: &[(&str, &str)]) -> String {
+    let mut sorted: Vec<(&str, &str)> = units.to_vec();
+    sorted.sort();
+    let mut buf = String::new();
+    for (id, sha) in sorted {
+        buf.push_str(id);
+        buf.push('\n');
+        buf.push_str(sha);
+        buf.push('\n');
+    }
+    hex::encode(Sha256::digest(buf.as_bytes()))
 }
 
 /// 规则的监听绑定地址（空 = 0.0.0.0）。
@@ -2790,37 +2857,39 @@ pub async fn apply_relay_after_change(app: &Shared, server_id: i64) -> bool {
     applied
 }
 
-/// 远程中转：把 realm.toml 推给 agent（幂等，agent 端比对指纹短路）。
-/// 某机器 relay 的期望 (配置体, 指纹)：有规则→渲染结果；无规则但「开关开着+
-/// 本机作用域」→占位待命（隧道实测 #3）；其余→空串（期望 agent 停服务清理）。
-/// 推送与心跳对账必须共用本函数取同一口径——曾因对账只看规则渲染（占位不在
-/// 期望集内）而推送会推占位，agent 忠实落盘后指纹永不相等，每 60s 心跳重推
-/// 并重启一次 realm。
-fn relay_expected(app: &App, server_id: i64) -> Result<(String, String)> {
-    if let Some(v) = render_relay_for_machine(app, server_id)? {
-        return Ok(v);
-    }
-    if realm_desired_running(app) && port_scopes(app, server_id).contains(&0) {
+/// 远程中转：把机器级信封推给 agent（幂等，agent 端逐 unit 指纹+运行态短路）。
+/// 某机器 relay 的期望 units：有规则→每规则一个 unit（render_relay_units）；
+/// 无规则但「开关开着+本机作用域」→占位 unit（id 沿用 main，与旧布局同址，
+/// 隧道实测 #3）；其余→空清单（agent 全停清理）。聚合指纹 = units_aggregate
+/// （与 agent 同口径，两仓 golden 测试锁死）。推送与心跳对账必须共用本函数
+/// 取同一口径——曾因对账只看规则渲染（占位不在期望集内）而推送会推占位，
+/// agent 忠实落盘后指纹永不相等，每 60s 心跳重推并重启一次 realm。
+fn relay_expected(app: &App, server_id: i64) -> Result<(Vec<RelayUnit>, String)> {
+    let mut units = render_relay_units(app, server_id)?;
+    if units.is_empty() && realm_desired_running(app) && port_scopes(app, server_id).contains(&0) {
         let body = placeholder_relay_body();
-        let hash = hex::encode(Sha256::digest(body.as_bytes()));
-        return Ok((body, hash));
+        units.push(RelayUnit {
+            id: "main".into(),
+            sha256: hex::encode(Sha256::digest(body.as_bytes())),
+            config: body,
+        });
     }
-    Ok((String::new(), String::new()))
+    let refs: Vec<(&str, &str)> = units.iter().map(|u| (u.id.as_str(), u.sha256.as_str())).collect();
+    let aggregate = units_aggregate(&refs);
+    Ok((units, aggregate))
 }
 
 pub fn reconcile_relay_push(app: &App, server_id: i64) -> Result<bool> {
-    // desired 与期望同源（=want 非空），不取全局开关：远端无腿机器的期望是
-    // 「停服务清理」，若带 true，agent 会自造占位写盘、指纹与空期望永不相等，
-    // 每 60s 心跳重推并重启 realm（占位语义三处分叉的环，2026-10-27 收口）。
-    let (body, hash) = relay_expected(app, server_id)?;
-    let desired = !hash.is_empty();
+    // 报文是机器级信封：units 全集即期望态，空清单 = agent 全停清理（旧协议
+    // 的 desired_running 语义并入清单有无，agent 无自造占位的余地）。
+    let (units, hash) = relay_expected(app, server_id)?;
     let pushed = {
         let agents = app.agents.read().unwrap_or_else(|e| e.into_inner());
         let Some(agent) = agents.get(&server_id) else { return Ok(false) };
         let frame = serde_json::json!({
             "jsonrpc": "2.0", "id": crate::auth::random_token(),
             "method": "relay.apply",
-            "params": { "config": body, "sha256": hash, "desired_running": desired },
+            "params": { "units": units, "sha256": hash },
         })
         .to_string();
         agent.tx.try_send(frame).is_ok()
@@ -3562,6 +3631,13 @@ fn push_varint(out: &mut Vec<u8>, mut v: u64) {
 
 // ---- 多机（M3）：按服务器渲染、对账与远程操作 ----
 
+/// 一个 relay unit 的最近上报状态（转发页徽标数据源，心跳 relay_units 捎带）。
+#[derive(Default, Clone, serde::Serialize, serde::Deserialize)]
+pub struct RelayUnitStatus {
+    pub sha256: String,
+    pub active: bool,
+}
+
 /// 一台远程服务器最近的对账状态。内存即可：agent 每 60s 重报，hub 重启后
 /// 一分钟内补齐。
 #[derive(Default, Clone)]
@@ -3579,6 +3655,9 @@ pub struct RemoteState {
     /// 最近一次见到的 sing-box 版本（版本过旧黄条，二期）：hub 只在已有的
     /// 触点（状态查询/安装/补装）缓存，没触点过的机器版本未知=不出黄条。
     pub version: String,
+    /// 每 relay unit 的最近上报状态（unit id → sha256/active），转发页徽标
+    /// 数据源。老 agent 不带此字段 → 空表（徽标未知态）。
+    pub relay_units: HashMap<String, RelayUnitStatus>,
 }
 
 /// 连接计量走的 api service 是 sing-box 1.14+ 特性，面板按 1.14.2 实测：
@@ -3889,6 +3968,7 @@ pub async fn on_agent_hash_ext(
     relay_reported: Option<&str>,
     gost_reported: Option<&str>,
     version: Option<&str>,
+    relay_units: Option<serde_json::Value>,
 ) -> Result<()> {
     {
         let mut st = app.proxy_remote.lock().unwrap_or_else(|e| e.into_inner());
@@ -3898,6 +3978,9 @@ pub async fn on_agent_hash_ext(
         if let Some(v) = version.filter(|v| !v.is_empty()) {
             st.version = v.to_owned();
         }
+        // 每 unit 状态快照（转发页徽标数据源）：老 agent 不带此字段 → 清空
+        // （徽标回退未知态），不影响其他对账状态。
+        st.relay_units = relay_units.and_then(|v| serde_json::from_value(v).ok()).unwrap_or_default();
     }
     let rendered = render_for_server(app, server_id)?;
     // sing-box 对账：agent 持有配置但期望为空（节点全停用/删除）→ 推空配置摘除。
@@ -3912,37 +3995,35 @@ pub async fn on_agent_hash_ext(
         eprintln!("[relay-debug] server {server_id} relay_reported={relay_reported:?}");
     }
     if let Some(relay_hash) = relay_reported {
-        // 期望指纹与推送同源（relay_expected）：占位待命也算已收敛态，
-        // 否则本机无规则时每 60s 心跳都会重推占位并重启 realm。
+        // 期望与推送同源（relay_expected 收口纪律）：聚合指纹含全部 unit 的
+        // sha256，任一 unit 漂移/增删都会改聚合，对账语义与旧单文件等价。
+        // 占位 unit 也算已收敛态——否则本机无规则时每 60s 重推并重启。
         let (_, want) = relay_expected(app, server_id)?;
-        let desired_running = !want.is_empty();
         if want != relay_hash {
             let pushed = reconcile_relay_push(app, server_id)?;
             eprintln!("[hash] relay reconcile: want={:?} got={:?} pushed={}", want, relay_hash, pushed);
             let _ = pushed;
-        } else if desired_running {
-            // 指纹一致但服务没跑（重启后 systemd 未拉起等）：确保拉起。
-            // relay_hash 只对盘上指纹、看不到运行态，所以收敛后也每拍 poke
-            // 一次，由 agent 侧 is-active 幂等兜着。
-            if server_id != 0 {
-                // 独立方法（批次1b）：只拉起不碰配置。曾借道 relay.apply 靠
-                // __noop__+空sha+ensure_started 三个魔法字段区分——一个 RPC
-                // 两个操作，调用者要背检查顺序（__noop__ 字面量曾被旧版当
-                // 配置写盘损坏 realm.toml）。
-                if let Err(e) = crate::agent_ws::call_agent(
-                    app,
-                    server_id,
-                    "relay.ensure_started",
-                    serde_json::json!({}),
-                    Duration::from_secs(1),
-                )
-                .await
-                {
-                    // warn 而非 debug：这条坏了意味着「拉活」失效而面板一切照常
-                    // （is-active 事故的教训：静默的成功/无日志的失败让链路断了
-                    // 数周无人知）——坏着时每 60s 一条正是该吵的时候；成功静默。
-                    warn!("node {server_id}: relay ensure-started poke failed: {e:#}");
-                }
+        } else if server_id != 0 {
+            // 聚合指纹恒非空（空清单=sha256("")），收敛即每拍 poke 确保拉起：
+            // relay_hash 只对盘上指纹、看不到运行态，agent 侧 is-active 幂等
+            // 兜着；期望为空清单时 poke 是无 unit 的空转，天然无操作。
+            // 独立方法（批次1b）：只拉起不碰配置。曾借道 relay.apply 靠
+            // __noop__+空sha+ensure_started 三个魔法字段区分——一个 RPC
+            // 两个操作，调用者要背检查顺序（__noop__ 字面量曾被旧版当
+            // 配置写盘损坏 realm.toml）。
+            if let Err(e) = crate::agent_ws::call_agent(
+                app,
+                server_id,
+                "relay.ensure_started",
+                serde_json::json!({}),
+                Duration::from_secs(1),
+            )
+            .await
+            {
+                // warn 而非 debug：这条坏了意味着「拉活」失效而面板一切照常
+                // （is-active 事故的教训：静默的成功/无日志的失败让链路断了
+                // 数周无人知）——坏着时每 60s 一条正是该吵的时候；成功静默。
+                warn!("node {server_id}: relay ensure-started poke failed: {e:#}");
             }
         }
     }
@@ -4916,7 +4997,7 @@ mod relay_render_tests {
         });
 
         // 真实心跳形状：relay_hash 恒在（无配置时空串）。
-        on_agent_hash_ext(&app, 2, "stale-singbox-hash", Some(""), None, Some("1.14.2")).await.unwrap();
+        on_agent_hash_ext(&app, 2, "stale-singbox-hash", Some(""), None, Some("1.14.2"), None).await.unwrap();
 
         // relay.apply 已推给机器 2（fire-and-forget,等桩消费到再断言）。
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
@@ -4947,7 +5028,7 @@ mod relay_render_tests {
         // 桩的状态：它当前上报的 relay 指纹。起点是「规则刚删、盘上还有旧配置」。
         let reported: std::sync::Arc<std::sync::Mutex<String>> =
             std::sync::Arc::new(std::sync::Mutex::new("stale-hash-of-deleted-rule".into()));
-        let pushes: std::sync::Arc<std::sync::Mutex<Vec<bool>>> = Default::default();
+        let pushes: std::sync::Arc<std::sync::Mutex<Vec<usize>>> = Default::default();
 
         let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(16);
         app.agents.write().unwrap().insert(2, crate::agent_ws::Agent::test_stub(tx));
@@ -4958,14 +5039,12 @@ mod relay_render_tests {
             while let Some(frame) = rx.recv().await {
                 let v: serde_json::Value = serde_json::from_str(&frame).unwrap();
                 if v["method"] == "relay.apply" {
-                    let desired = v["params"]["desired_running"].as_bool().unwrap();
-                    let empty = v["params"]["config"].as_str().unwrap_or("x").is_empty();
-                    pushed_seen.lock().unwrap().push(desired);
-                    if empty {
-                        // 忠实两分：true=自造占位写盘（指纹变为占位哈希），
-                        // false=停服务删文件（指纹清空）。
-                        *reported_seen.lock().unwrap() =
-                            if desired { "fabricated-placeholder-hash".into() } else { String::new() };
+                    // 忠实 agent 信封语义：逐 unit 落盘；空清单 = 全停清理，
+                    // 随后上报聚合变为空清单聚合（服务停、文件清）。
+                    let units = v["params"]["units"].as_array().cloned().unwrap_or_default();
+                    pushed_seen.lock().unwrap().push(units.len());
+                    if units.is_empty() {
+                        *reported_seen.lock().unwrap() = units_aggregate(&[]);
                     }
                 }
                 if let Some(id) = v["id"].as_str() {
@@ -4980,14 +5059,18 @@ mod relay_render_tests {
         // 消费帧，桩的状态更新才发生在下一拍之前。
         for _ in 0..3 {
             let hash = reported.lock().unwrap().clone();
-            on_agent_hash_ext(&app, 2, "", Some(&hash), None, None).await.unwrap();
+            on_agent_hash_ext(&app, 2, "", Some(&hash), None, None, None).await.unwrap();
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         }
 
         let pushes = pushes.lock().unwrap();
         assert_eq!(pushes.len(), 1, "三拍心跳只该推一次（首拍清场），实际 {:?} 次", pushes);
-        assert!(!pushes[0], "空期望的推送必须带 desired_running=false（停服务清理）");
-        assert!(reported.lock().unwrap().is_empty(), "收敛后 agent 指纹应为空（服务已停、文件已清）");
+        assert_eq!(pushes[0], 0, "空期望的推送必须是空清单（全停清理），不得自造占位");
+        assert_eq!(
+            reported.lock().unwrap().as_str(),
+            units_aggregate(&[]),
+            "收敛后 agent 指纹应为空清单聚合（服务已停、文件已清）"
+        );
     }
 
     /// 收敛态（上报指纹==期望、realm 应在跑）的心跳必须真正发出 ensure_started
@@ -5034,7 +5117,7 @@ mod relay_render_tests {
         // 上报指纹与期望完全一致（收敛）：唯一该发生的动作就是拉活 poke。
         let (_, want) = relay_expected(&app, 2).unwrap();
         assert!(!want.is_empty(), "机器 2 有备用腿，期望指纹非空");
-        on_agent_hash_ext(&app, 2, "", Some(&want), None, None).await.unwrap();
+        on_agent_hash_ext(&app, 2, "", Some(&want), None, None, None).await.unwrap();
 
         // poke 走 call_agent 等应答，函数返回时帧必已被桩消费并记账。
         let got = pokes.lock().unwrap();
@@ -5071,27 +5154,52 @@ mod relay_render_tests {
 
     #[test]
     fn relay_expected_treats_placeholder_as_converged_state() {
-        // 有规则：期望=渲染结果。
+        // 有规则：期望=每规则一个 unit，聚合=units_aggregate（对账同口径）。
         let app = app_with_rule(base_rule(), &[("1.1.1.1", 443)]);
-        let (body, hash) = relay_expected(&app, 1).unwrap();
-        let (rbody, rhash) = render_relay_for_machine(&app, 1).unwrap().unwrap();
-        assert_eq!(body, rbody);
-        assert_eq!(hash, rhash);
+        let (units, hash) = relay_expected(&app, 1).unwrap();
+        let rendered = render_relay_units(&app, 1).unwrap();
+        assert_eq!(units.len(), 1);
+        assert_eq!(units[0].id, "1", "unit id = 规则 id");
+        assert_eq!(units[0].config, rendered[0].config);
+        let refs: Vec<(&str, &str)> = units.iter().map(|u| (u.id.as_str(), u.sha256.as_str())).collect();
+        assert_eq!(hash, units_aggregate(&refs));
 
-        // 无规则+开关开+本机作用域（server 0）：期望占位待命——agent 落盘后
-        // 上报的正是这个指纹，对账必须视为已收敛（曾每 60s 重推重启 realm）。
+        // 无规则+开关开+本机作用域（server 0）：期望占位 unit（id=main，与
+        // 旧布局同址）——agent 落盘后上报的正是这个聚合，对账必须视为已收敛
+        // （曾每 60s 重推重启 realm）。
         let app = crate::App::for_test(crate::db::Db::open(":memory:").unwrap());
-        let (body, hash) = relay_expected(&app, 0).unwrap();
-        let ph = placeholder_relay_body();
-        assert_eq!(body, ph);
-        assert_eq!(hash, hex::encode(Sha256::digest(ph.as_bytes())));
+        let (units, _) = relay_expected(&app, 0).unwrap();
+        assert_eq!(units.len(), 1, "本机作用域+开关开应只含占位 unit");
+        assert_eq!(units[0].id, "main");
+        assert_eq!(units[0].config, placeholder_relay_body());
 
         // 无规则的远程机：占位仅限本机作用域，远程期望空清理。
-        assert_eq!(relay_expected(&app, 7).unwrap(), (String::new(), String::new()));
+        let (units, hash) = relay_expected(&app, 7).unwrap();
+        assert!(units.is_empty());
+        assert_eq!(hash, units_aggregate(&[]));
 
         // 无规则+开关关：本机作用域也期望空清理。
         app.db.set("realm_desired_running", "off").unwrap();
-        assert_eq!(relay_expected(&app, 0).unwrap(), (String::new(), String::new()));
+        let (units, _) = relay_expected(&app, 0).unwrap();
+        assert!(units.is_empty());
+    }
+
+    /// 聚合指纹 golden 向量：与 agent 侧 monitor-agent/src/proxy.rs 的同名
+    /// 测试同向量同期望值——两仓口径锁死，一侧改动另一侧必红。
+    #[test]
+    fn units_aggregate_matches_golden_vector() {
+        let ones = "1".repeat(64);
+        let twos = "2".repeat(64);
+        let units = [("17", ones.as_str()), ("main", twos.as_str())];
+        assert_eq!(
+            units_aggregate(&units),
+            "58ebda98f681be3f9a61c270a8374bf990fcf9cf50b0262cc426f308f7c86509"
+        );
+        assert_eq!(
+            units_aggregate(&[]),
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "空清单 = sha256(\"\")"
+        );
     }
 
     #[test]

@@ -4249,6 +4249,16 @@ pub async fn relay_list(_: Admin, State(app): State<Shared>) -> Response {
         Err(e) => return fail(e),
     };
     let all_targets = app.db.relay_targets().unwrap_or_default();
+    // 每 unit 运行态快照（心跳 relay_units 捎带，monitor-realm@<规则id>）：
+    // 规则行徽标的数据源。查不到 = 该机 agent 离线或老 agent 未上报 → Null
+    // （前端显示未知，不猜）。
+    let unit_states: std::collections::HashMap<i64, std::collections::HashMap<String, bool>> = app
+        .proxy_remote
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .map(|(sid, st)| (*sid, st.relay_units.iter().map(|(id, u)| (id.clone(), u.active)).collect()))
+        .collect();
     // 导入式规则的中转版分享链接（原始链接地址改成中转机地址与监听端口）。
     let rules: Vec<Value> = rules
         .iter()
@@ -4259,6 +4269,16 @@ pub async fn relay_list(_: Admin, State(app): State<Shared>) -> Response {
                 None => Value::Null,
             };
             v["targets"] = json!(all_targets.iter().filter(|t| t.rule_id == r.id).collect::<Vec<_>>());
+            // unit 运行态：入口机必查；隧道规则再看落地机（两端各一 unit）。
+            let unit_on = |sid: i64| -> Value {
+                unit_states
+                    .get(&sid)
+                    .and_then(|m| m.get(&r.id.to_string()))
+                    .map(|a| json!(a))
+                    .unwrap_or(Value::Null)
+            };
+            v["entry_running"] = unit_on(r.server_id);
+            v["exit_running"] = if r.exit_server_id > 0 { unit_on(r.exit_server_id) } else { Value::Null };
             v
         })
         .collect();

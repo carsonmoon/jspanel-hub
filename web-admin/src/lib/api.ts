@@ -424,6 +424,10 @@ export type RelayRule = {
   /** 导入式规则的中转版分享链接；手动规则为 null。 */
   share: string | null
   targets: RelayTarget[]
+  /** 入口机上本规则 unit（monitor-realm@<id>）的运行态；null=未知（agent 离线/老 agent 未上报）。 */
+  entry_running?: boolean | null
+  /** 隧道规则落地机 unit 的运行态；null=未知。 */
+  exit_running?: boolean | null
 }
 
 /** 一台中转机/落地机的 realm 状态（隧道页每机一行）。 */
