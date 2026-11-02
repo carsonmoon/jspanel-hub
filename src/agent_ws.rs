@@ -596,17 +596,14 @@ fn dispatch(
             let relay_units = rpc.params.get("relay_units").cloned();
             let app = app.clone();
             tokio::spawn(async move {
-                if let Err(e) = crate::proxy::on_agent_hash_ext(
-                    &app,
-                    node_id,
-                    &hash,
-                    relay_hash.as_deref(),
-                    gost_hash.as_deref(),
-                    version.as_deref(),
+                let hb = crate::proxy::Heartbeat {
+                    reported: &hash,
+                    relay_reported: relay_hash.as_deref(),
+                    gost_reported: gost_hash.as_deref(),
+                    version: version.as_deref(),
                     relay_units,
-                )
-                .await
-                {
+                };
+                if let Err(e) = crate::proxy::on_agent_hash_ext(&app, node_id, hb).await {
                     debug!("node {node_id}: proxy reconciliation failed: {e:#}");
                 }
             });
