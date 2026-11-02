@@ -594,8 +594,8 @@ async fn call_tool(app: &App, _lease: &str, name: &str, args: &Value) -> std::re
     match name {
         "get_overview" => {
             let traffic = app.db.proxy_traffic().map_err(ekey)?;
-            let today_rx: i64 = traffic.iter().map(|t| t.2).sum();
-            let today_tx: i64 = traffic.iter().map(|t| t.3).sum();
+            let today_rx: i64 = traffic.iter().map(|t| t.today_rx).sum();
+            let today_tx: i64 = traffic.iter().map(|t| t.today_tx).sum();
             let nodes = app.db.nodes().map_err(ekey)?;
             let online: usize = {
                 let agents = app.agents.read().unwrap_or_else(|e| e.into_inner());
