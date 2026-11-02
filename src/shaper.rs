@@ -63,6 +63,20 @@ pub async fn replay_local(app: crate::Shared) {
     }
 }
 
+/// root 挂 HTB：qdisc replace 不是幂等操作——HTB 已在 root 上时再 replace
+/// 内核报「Change operation not supported」（生产 one 实锤），所以已挂就
+/// 跳过；class/filter 的 replace 才有真幂等语义。default 99 恒定，重挂
+/// 没有可变参数。
+fn ensure_htb(nic: &str, handle: &str) -> Result<()> {
+    let out = Command::new("tc").args(["qdisc", "show", "dev", nic]).output()?;
+    let text = String::from_utf8_lossy(&out.stdout);
+    let wanted = format!("htb {handle}:");
+    if text.contains(&wanted) {
+        return Ok(());
+    }
+    tc(&["qdisc", "replace", "dev", nic, "root", "handle", &format!("{handle}:"), "htb", "default", "99"])
+}
+
 fn tc(args: &[&str]) -> Result<()> {
     let out = Command::new("tc")
         .args(args)
@@ -147,7 +161,7 @@ fn build(nic: &str, ports: &[ShapedPort]) -> Result<()> {
     ip(&["link", "set", IFB, "up"])?;
 
     // 下载方向：出口网卡 root HTB，default 99 让未托管流量不受影响。
-    tc(&["qdisc", "replace", "dev", nic, "root", "handle", "1:", "htb", "default", "99"])?;
+    ensure_htb(nic, "1")?;
     tc(&[
         "class",
         "replace",
@@ -179,7 +193,7 @@ fn build(nic: &str, ports: &[ShapedPort]) -> Result<()> {
         PARENT_RATE,
     ])?;
     // 上传方向：IFB 上的第二棵 HTB。
-    tc(&["qdisc", "replace", "dev", IFB, "root", "handle", "2:", "htb", "default", "99"])?;
+    ensure_htb(IFB, "2")?;
     tc(&[
         "class",
         "replace",

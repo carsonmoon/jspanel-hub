@@ -22,6 +22,13 @@ use crate::db::GostRule;
 /// 与 agent 侧 GOST_VERSION 一致的钉死版本（ensure 补装的期望版本）。
 pub const GOST_VERSION: &str = "3.3.2";
 
+/// gost API 服务端口：渲染出的配置固定开在 127.0.0.1:<这里>，agent 热重载
+/// 打它。**18080 被 realm-api 单进程占用**（agent relay.rs 实例模型），gost
+/// 退到 18081——两核心同机并存时端口必须错开，否则 gost bind 失败崩溃循环
+/// （生产 one 实锤）。agent 侧常量在 monitor-agent/src/proxy/gost.rs，
+/// 两仓一致性由 agent 仓 tests/gost_port_guard.rs 锁死。
+pub const GOST_API_PORT: u16 = 18081;
+
 /// 多目标选择策略（UI 值即 gost 值，x/config/parsing/selector/parse.go 实证）。
 const BALANCES: [&str; 4] = ["fifo", "round", "rand", "hash"];
 /// 隧道节点间协议（批次0 定案 v1 三种；mtls/mwss 要加时只扩这里与渲染映射）。
@@ -282,7 +289,7 @@ pub fn render_gost_for_machine(app: &crate::App, server_id: i64) -> Result<Optio
         return Ok(None);
     }
     let mut body = json!({
-        "api": { "addr": "127.0.0.1:18080" },
+        "api": { "addr": format!("127.0.0.1:{GOST_API_PORT}") },
         "services": services,
     });
     if !chains.is_empty() {
@@ -458,7 +465,7 @@ mod tests {
         assert_eq!(nodes[1]["addr"], json!("2.2.2.2:443"));
         assert_eq!(v["services"][0]["forwarder"]["selector"]["strategy"], json!("fifo"));
         // api 服务固定开在环回，热重载打它
-        assert_eq!(v["api"]["addr"], json!("127.0.0.1:18080"));
+        assert_eq!(v["api"]["addr"], json!("127.0.0.1:18081"));
         assert!(v.get("chains").is_none());
     }
 
