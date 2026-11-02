@@ -4303,6 +4303,48 @@ async fn server_realm_status(app: &App, server_id: i64, name: String) -> Value {
     }
 }
 
+/// 一台机器的 gost 状态（隧道页每机一颗灯）。gost 规则只挂真实节点、执行者
+/// 只有 agent（无本机直写路径），不需要 realm 那套 server_id==0 特判——
+/// 统一现场问 agent（5s 超时，同转发页口径）。
+async fn server_gost_status(app: &App, server_id: i64, name: String) -> Value {
+    let online = app.agents.read().unwrap_or_else(|e| e.into_inner()).contains_key(&server_id);
+    if !online {
+        return json!({ "server_id": server_id, "name": name, "online": false, "installed": false, "version": "", "running": false });
+    }
+    let cached_installed = app
+        .proxy_remote
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&server_id)
+        .map(|s| s.gost_installed)
+        .unwrap_or(false);
+    match crate::agent_ws::call_agent(app, server_id, "proxy.core.status", json!({}), Duration::from_secs(5))
+        .await
+    {
+        Ok(v) => {
+            // 未装二进制时 gost_version_string 返回空串：installed 由版本派生。
+            // 顺手刷新 ensure 缓存（与 realm_installed 同款触点）。
+            let version = v["gost_version"].as_str().unwrap_or_default().to_owned();
+            let installed = !version.is_empty();
+            app.proxy_remote
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .entry(server_id)
+                .or_default()
+                .gost_installed = installed;
+            json!({
+                "server_id": server_id, "name": name, "online": true,
+                "installed": installed, "version": version,
+                "running": v["gost_running"].as_bool().unwrap_or(false),
+            })
+        }
+        // 问不通但 agent 在线：用 ensure 缓存兜底，别把「超时」误报成「未装」。
+        Err(_) => {
+            json!({ "server_id": server_id, "name": name, "online": true, "installed": cached_installed, "version": "", "running": false })
+        }
+    }
+}
+
 /// 中转规则列表 + 各台中转机的 realm 状态。
 pub async fn relay_list(_: Admin, State(app): State<Shared>) -> Response {
     let rules = match app.db.relay_rules() {
@@ -4526,11 +4568,30 @@ pub async fn delete_relay_rule(_: Admin, State(app): State<Shared>, Path(id): Pa
 
 // ---- gost 转发/隧道（隧道模块）----
 
+/// 隧道规则列表 + 涉及机器的 gost 状态。
 pub async fn gost_list(_: Admin, State(app): State<Shared>) -> Response {
     let rules = match app.db.gost_rules() {
         Ok(r) => r,
         Err(e) => return fail(e),
     };
+    // 隧道页每机状态灯：出现在任一规则里的机器（入口+出口）现场问 agent。
+    // gost 空期望=停服清文件、无 desired 开关——无规则时 unit 停着属正常，
+    // 黄「等待推送」只给被启用规则引用的机器（前端按引用区分黄/灰）。
+    let mut ids: Vec<i64> =
+        rules.iter().flat_map(|r| [r.server_id, r.exit_server_id]).filter(|id| *id > 0).collect();
+    ids.sort();
+    ids.dedup();
+    if ids.is_empty() {
+        // 空页面也给一颗灯（转发页「本机永远在列」同款）：面板机节点行。
+        if let Some(local) = proxy::local_node_server_id(&app) {
+            ids.push(local);
+        }
+    }
+    let mut servers = Vec::new();
+    for id in ids {
+        let name = app.db.node(id).ok().flatten().map(|n| n.name).unwrap_or_else(|| format!("服务器 {id}"));
+        servers.push(server_gost_status(&app, id, name).await);
+    }
     let rules: Vec<Value> = rules
         .iter()
         .map(|r| {
@@ -4540,7 +4601,7 @@ pub async fn gost_list(_: Admin, State(app): State<Shared>) -> Response {
         })
         .collect();
     let port_pool = app.db.get("proxy_port_pool").unwrap_or_else(|| "20000-50000".into());
-    Json(json!({ "rules": rules, "port_pool": port_pool, "gost_version": crate::gost::GOST_VERSION }))
+    Json(json!({ "rules": rules, "port_pool": port_pool, "gost_version": crate::gost::GOST_VERSION, "servers": servers }))
         .into_response()
 }
 

@@ -9,7 +9,7 @@ import { Card } from "@/components/ui/card"
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table"
 import { Switch } from "@/components/ui/switch"
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip"
-import { api, type GostData, type GostRule } from "@/lib/api"
+import { api, type GostData, type GostRule, type GostStatus } from "@/lib/api"
 import { copy } from "@/components/QrDialog"
 
 const transportLabel: Record<string, string> = { tls: "TLS", wss: "WSS", tcp: "TCP" }
@@ -26,9 +26,48 @@ function useConfirmDelete() {
   return { armed, arm: setArmed }
 }
 
-function GostCard({ rules, servers, portPool, gostVersion, reload }: {
+/// 一台机器的 gost 状态徽标（转发页 RealmPill 同款）：健康=绿点零存在感，
+/// 异常只报原因。gost 空期望=停服清文件、无 desired 开关——没被启用规则
+/// 引用的机器停着属正常（灰「空闲」），黄「等待推送」只给规则引用的机器。
+function GostPill({ status, referenced }: { status: GostStatus; referenced: boolean }) {
+  const abnormal = !status.online
+    ? "离线（agent 失联）"
+    : !status.installed
+      ? referenced
+        ? "未安装 gost（等待自动补装）"
+        : "未安装 gost（无规则，建规则自动装）"
+      : !status.running
+        ? referenced
+          ? "已停止（等待配置推送）"
+          : "空闲（无启用规则已停服）"
+        : ""
+  const tone = !abnormal
+    ? "bg-emerald-500"
+    : abnormal.startsWith("离线")
+      ? "bg-red-500"
+      : referenced
+        ? "bg-amber-500"
+        : "bg-zinc-400"
+  return (
+    <Tooltip disableHoverableContent>
+      <TooltipTrigger asChild>
+        <span className="inline-flex cursor-default items-center gap-1 rounded-full px-1 py-0.5 text-xs">
+          <span className={`size-2 rounded-full ${tone}`} />
+          <span className="max-w-28 truncate font-medium">{status.name}</span>
+        </span>
+      </TooltipTrigger>
+      <TooltipContent side="bottom" sideOffset={4}>
+        <div className="tnum">{status.name}</div>
+        <div className="opacity-70">{abnormal || "运行中"}</div>
+      </TooltipContent>
+    </Tooltip>
+  )
+}
+
+function GostCard({ rules, servers, gostServers, portPool, gostVersion, reload }: {
   rules: GostRule[]
   servers: Machine[]
+  gostServers: GostStatus[]
   portPool: string
   gostVersion: string
   reload: () => Promise<void>
@@ -38,6 +77,13 @@ function GostCard({ rules, servers, portPool, gostVersion, reload }: {
   const { armed, arm } = useConfirmDelete()
   const serverName = (id: number) => servers.find((s) => s.id === id)?.name ?? `服务器 ${id}`
   const serverIp = (id: number) => servers.find((s) => s.id === id)?.ip ?? ""
+  // 启用规则引用的机器集合：黄「等待推送」只给它们，其余机器停服属正常（灰）。
+  const referenced = new Set<number>()
+  for (const r of rules) {
+    if (!r.enabled) continue
+    referenced.add(r.server_id)
+    if (r.exit_server_id > 0) referenced.add(r.exit_server_id)
+  }
 
   const toggle = async (rule: GostRule, enabled: boolean) => {
     try {
@@ -65,6 +111,12 @@ function GostCard({ rules, servers, portPool, gostVersion, reload }: {
         <div>
           <div className="flex items-center gap-2">
             <div className="font-medium">隧道规则</div>
+            {/* 每台机器一颗状态徽标（转发页同款）：健康=绿点零存在感 */}
+            <div className="flex items-center gap-1.5">
+              {gostServers.map((s) => (
+                <GostPill key={s.server_id} status={s} referenced={referenced.has(s.server_id)} />
+              ))}
+            </div>
             {gostVersion && <Badge variant="outline">gost {gostVersion}</Badge>}
           </div>
           <div className="text-sm text-muted-foreground">
@@ -183,11 +235,11 @@ function GostCard({ rules, servers, portPool, gostVersion, reload }: {
 // ---- 隧道页（gost）：端口转发 + 加密隧道，与转发页（realm）并行独立 ----
 
 function useGostData() {
-  const [data, setData] = useState<GostData>({ rules: [], port_pool: "20000-50000", gost_version: "" })
+  const [data, setData] = useState<GostData>({ rules: [], port_pool: "20000-50000", gost_version: "", servers: [] })
   const [servers, setServers] = useState<Machine[]>([])
   const load = useCallback(async () => {
     const [g, n] = await Promise.all([
-      api<GostData>("/gost").catch(() => ({ rules: [], port_pool: "20000-50000", gost_version: "" })),
+      api<GostData>("/gost").catch(() => ({ rules: [], port_pool: "20000-50000", gost_version: "", servers: [] })),
       api<{ nodes?: { id: number; name: string; online?: boolean; local?: boolean; addresses?: { address: string }[]; ipv4?: string }[] } | { id: number; name: string; online?: boolean; local?: boolean; addresses?: { address: string }[]; ipv4?: string }[]>("/nodes").catch(() => ({ nodes: [] })),
     ])
     setData(g)
@@ -214,7 +266,7 @@ export default function Gost() {
   const { data, servers, reload } = useGostData()
   return (
     <div className="flex flex-col gap-6">
-      <GostCard rules={data.rules} servers={servers} portPool={data.port_pool} gostVersion={data.gost_version} reload={reload} />
+      <GostCard rules={data.rules} servers={servers} gostServers={data.servers ?? []} portPool={data.port_pool} gostVersion={data.gost_version} reload={reload} />
     </div>
   )
 }

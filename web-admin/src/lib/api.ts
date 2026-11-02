@@ -472,6 +472,17 @@ export type GostData = {
   rules: GostRule[]
   port_pool: string
   gost_version: string
+  /** 涉及机器的 gost 状态（隧道页每机一颗灯）；老后端不带此字段。 */
+  servers?: GostStatus[]
+}
+
+export type GostStatus = {
+  server_id: number
+  name: string
+  online: boolean
+  installed: boolean
+  version: string
+  running: boolean
 }
 
 
