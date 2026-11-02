@@ -253,13 +253,21 @@ fn choose_free_port(pool: &str, used: &HashSet<i64>) -> Result<i64> {
     Ok(free[index])
 }
 
+/// 一台机器上全部已占端口的统一口径（候选 4 收单点）：协议侧（本机直挂 ∪
+/// 镜像到该机的节点，「刺激」事故口径）∪ 转发双腿 ∪ 隧道双腿。allocate_* 与
+/// *_port_taken 都从这里取数——占用口径只此一份，新增端口家族只改这里。
+pub fn used_ports_all_on(app: &App, server_id: i64) -> Result<Vec<i64>> {
+    let mut out = used_ports_on(app, server_id)?;
+    out.extend(relay_ports_on(app, server_id)?);
+    out.extend(crate::gost::gost_ports_on(app, server_id)?);
+    Ok(out)
+}
+
 /// Picks a random free port in the pool on one server. The pool is the
 /// `proxy_port_pool` setting, `20000-50000` unless set otherwise（设计文档 4）.
 fn allocate_port(app: &App, server_id: i64) -> Result<i64> {
     let pool = app.db.get("proxy_port_pool").unwrap_or_else(|| "20000-50000".into());
-    let mut used: HashSet<i64> = used_ports_on(app, server_id)?.into_iter().collect();
-    used.extend(relay_ports_on(app, server_id)?);
-    used.extend(crate::gost::gost_ports_on(app, server_id)?);
+    let used: HashSet<i64> = used_ports_all_on(app, server_id)?.into_iter().collect();
     choose_free_port(&pool, &used)
 }
 
@@ -270,9 +278,7 @@ fn allocate_port(app: &App, server_id: i64) -> Result<i64> {
 /// 拒绝应用（「刺激」事故）。
 fn allocate_cdn_port(app: &App, server_id: i64, protocol: &str) -> Result<i64> {
     let pool = cdn_port_pool(protocol);
-    let mut used: HashSet<i64> = used_ports_on(app, server_id)?.into_iter().collect();
-    used.extend(relay_ports_on(app, server_id)?);
-    used.extend(crate::gost::gost_ports_on(app, server_id)?);
+    let used: HashSet<i64> = used_ports_all_on(app, server_id)?.into_iter().collect();
     pool.iter().copied().find(|p| !used.contains(p)).ok_or_else(|| {
         anyhow::Error::msg(crate::Shown(format!(
             "该主机的 Cloudflare 回源端口（{}）已全部被占用，无法再建 CDN 中转",
@@ -2101,32 +2107,32 @@ pub(crate) fn percent_decode(s: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
-/// 中转监听端口的自动分配：端口池内，排除该服务器上节点与中转已占的端口
-/// （监听段全展开——此前只排除段首端口，段内其余端口会被分出去）。
+/// 中转监听端口的自动分配：端口池内，排除该服务器上已占的端口（监听段全
+/// 展开——此前只排除段首端口，段内其余端口会被分出去）。占用口径
+/// used_ports_all_on（含镜像节点占用）：镜像机同样独占端口，此前用
+/// proxy_used_ports_scoped 漏掉镜像——「刺激」事故的镜像口径修复当时只
+/// 改了协议侧 allocator，转发侧漏改（候选 4 补齐）。
 pub fn allocate_relay_port(app: &App, server_id: i64) -> Result<i64> {
     let pool = app.db.get("proxy_port_pool").unwrap_or_else(|| "20000-50000".into());
-    let Some((lo, hi)) = pool.split_once('-') else {
-        refuse!("端口池格式应为 起始-结束，例如 20000-50000")
-    };
-    let (Ok(lo), Ok(hi)) = (lo.trim().parse::<i64>(), hi.trim().parse::<i64>()) else {
-        refuse!("端口池起止不是数字：{pool}")
-    };
-    let _ = (lo, hi); // 池边界由 choose_free_port 统一解析与报错
-    let mut used: HashSet<i64> = proxy_used_ports_scoped(app, server_id)?.into_iter().collect();
-    used.extend(relay_ports_on(app, server_id)?);
-    used.extend(crate::gost::gost_ports_on(app, server_id)?);
+    let _ = &pool; // 池边界由 choose_free_port 统一解析与报错
+    let used: HashSet<i64> = used_ports_all_on(app, server_id)?.into_iter().collect();
     // 与协议侧同款：池内随机取空闲端口（此前是 find 取第一个空闲，顺序可预测）。
     choose_free_port(&pool, &used)
 }
 
-/// 端口在一台机器上是否已被占用（节点端口 / 中转监听 / 隧道出口半边），
-/// `except_rule` 用于编辑时豁免规则自身。
+/// 端口在一台机器上是否已被占用（节点端口〔含镜像〕/ 中转双腿 / 隧道出口半
+/// 边），`except_rule` 用于编辑时豁免规则自身。节点侧口径与 allocator 同源
+/// （used_ports_all_on 的节点半边——镜像节点占的端口同样冲突，「刺激」口径）。
 pub fn relay_port_taken(app: &App, server_id: i64, port: i64, except_rule: i64) -> Result<bool> {
     if port <= 0 {
         return Ok(false);
     }
     let scopes = port_scopes(app, server_id);
-    if proxy_used_ports_scoped(app, server_id)?.contains(&port) {
+    // 节点占用（含镜像）＋转发＋隧道双腿都在统一口径里；转发规则自身被
+    // except_rule 豁免不了这个集合，故转发腿仍走下面逐规则比对。
+    let node_ports = used_ports_on(app, server_id)?;
+    let gost_ports = crate::gost::gost_ports_on(app, server_id)?;
+    if node_ports.contains(&port) || gost_ports.contains(&port) {
         return Ok(true);
     }
     for r in app.db.relay_rules()? {
@@ -3392,9 +3398,9 @@ fn book_sub_usage(app: &App, server_id: i64, per_user: &HashMap<String, (i64, i6
     let Ok(mapping) = app.db.proxy_sub_of_names(server_id, &names) else { return };
     let deltas: Vec<(i64, i64, i64)> = mapping
         .iter()
-        .filter_map(|(name, sub_id)| {
-            sub_id.map(|id| {
-                let (up, down) = per_user.get(name).copied().unwrap_or((0, 0));
+        .filter_map(|m| {
+            m.sub_user_id.map(|id| {
+                let (up, down) = per_user.get(&m.name).copied().unwrap_or((0, 0));
                 (id, up, down)
             })
         })
@@ -3428,9 +3434,9 @@ fn book_credential_level_usage(app: &App, server_id: i64, per_user: &HashMap<Str
     if let Ok(pu_map) = app.db.proxy_user_ids_of_names(server_id, &pu_names) {
         let pu_deltas: Vec<(i64, i64, i64)> = pu_map
             .iter()
-            .map(|(name, pu_id)| {
-                let (up, down) = per_user.get(name).copied().unwrap_or((0, 0));
-                (*pu_id, up, down)
+            .map(|m| {
+                let (up, down) = per_user.get(&m.name).copied().unwrap_or((0, 0));
+                (m.proxy_user_id, up, down)
             })
             .collect();
         match app.db.bump_proxy_user_usage(&pu_deltas) {
@@ -4124,20 +4130,78 @@ pub fn reconcile_push(app: &App, server_id: i64) -> Result<bool> {
     Ok(pushed)
 }
 
+/// 一次心跳携带的对账输入（候选 5：此前是 5 个 Option 位置参数——新增对账
+/// 家族就加一位，调用点靠数位置传参，与 db.rs 列序同款病）。字段全部 Option：
+/// 旧 agent 不带的心跳项就是 None。
+#[derive(Default)]
+pub struct Heartbeat<'a> {
+    /// sing-box 整份配置指纹。
+    pub reported: &'a str,
+    /// relay 聚合指纹（units 信封）。
+    pub relay_reported: Option<&'a str>,
+    /// gost 配置指纹。
+    pub gost_reported: Option<&'a str>,
+    /// sing-box 版本（黄条数据源）。
+    pub version: Option<&'a str>,
+    /// 每 relay unit 状态快照（转发页徽标数据源）。
+    pub relay_units: Option<serde_json::Value>,
+}
+
+/// 一条对账家族的骨架参数（候选 5）：转发/隧道的心跳对账语义同构——期望来
+/// 源、推送函数、补装动作、poke 方法与「空期望是否 poke」是全部真差异。第三
+/// 条对账链进来时填这个结构即可，不再手抄比对/重推/poke 骨架。
+type EnsureInstall<'a> = std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + 'a>>;
+
+struct Family<'a> {
+    tag: &'a str,
+    expected: &'a (dyn Fn(&App, i64) -> Result<String> + Send + Sync),
+    push: &'a (dyn Fn(&App, i64) -> Result<()> + Send + Sync),
+    ensure_install: &'a (dyn Fn(&App, i64) -> EnsureInstall<'_> + Send + Sync),
+    poke_method: &'a str,
+    /// relay 聚合指纹恒非空、空清单 poke 天然无操作（true）；gost 空期望=
+    /// 停服清文件、不 poke（false）——占位语义的本质差异，勿合并。
+    poke_when_empty: bool,
+}
+
+/// 心跳对账骨架：上报指纹 ≠ 期望 → （可选补装后）重推；一致 → 视语义 poke
+/// 拉起。期望与推送同源纪律在两侧 expected/push 闭包里保持单一口径。
+async fn reconcile_family(app: &App, server_id: i64, got: &str, f: Family<'_>) -> Result<()> {
+    let want = (f.expected)(app, server_id)?;
+    if want != got {
+        (f.ensure_install)(app, server_id).await?;
+        (f.push)(app, server_id)?;
+        eprintln!("[hash] {} reconcile: want={want:?} got={got:?} pushed", f.tag);
+    } else if (f.poke_when_empty || !want.is_empty()) && server_id != 0 {
+        // 收敛即每拍 poke 确保拉起：指纹只对盘上配置、看不到运行态，agent
+        // 侧 is-active 幂等兜着。独立方法（批次1b）：只拉起不碰配置。曾借道
+        // apply 靠 __noop__+空sha+ensure_started 三个魔法字段区分——一个 RPC
+        // 两个操作，调用者要背检查顺序（__noop__ 字面量曾被旧版当配置写盘
+        // 损坏 realm.toml）。
+        if let Err(e) = crate::agent_ws::call_agent(
+            app,
+            server_id,
+            f.poke_method,
+            serde_json::json!({}),
+            Duration::from_secs(1),
+        )
+        .await
+        {
+            // warn 而非 debug：这条坏了意味着「拉活」失效而面板一切照常
+            // （is-active 事故的教训：静默的成功/无日志的失败让链路断了
+            // 数周无人知）——坏着时每 60s 一条正是该吵的时候；成功静默。
+            warn!("node {server_id}: {} ensure-started poke failed: {e:#}", f.tag);
+        }
+    }
+    Ok(())
+}
+
 /// agent 上报了它本地配置的指纹（每 60s 及上线时）：记账并按需补推。
 /// M5：relay_hash 由同一心跳携带，hub 一并比对（远程 Realm 的对账驱动）。
 /// 二期起 sing-box 版本也随心跳捎带：非空就喂进缓存（版本过旧黄条数据源）。
 /// 异步：收敛后的「确保拉起」要走一次 call_agent 往返，dispatch 侧以独立
 /// 任务调用本函数。
-pub async fn on_agent_hash_ext(
-    app: &App,
-    server_id: i64,
-    reported: &str,
-    relay_reported: Option<&str>,
-    gost_reported: Option<&str>,
-    version: Option<&str>,
-    relay_units: Option<serde_json::Value>,
-) -> Result<()> {
+pub async fn on_agent_hash_ext(app: &App, server_id: i64, hb: Heartbeat<'_>) -> Result<()> {
+    let Heartbeat { reported, relay_reported, gost_reported, version, relay_units } = hb;
     {
         let mut st = app.proxy_remote.lock().unwrap_or_else(|e| e.into_inner());
         let st = st.entry(server_id).or_default();
@@ -4168,67 +4232,51 @@ pub async fn on_agent_hash_ext(
     if std::env::var("MONITOR_RELAY_DEBUG").as_deref() == Ok("1") {
         eprintln!("[relay-debug] server {server_id} relay_reported={relay_reported:?}");
     }
+    // 转发对账：期望来自 relay_expected（与推送同源），不一致重推；一致 →
+    // 每拍 poke 确保拉起（agent is-active 幂等兜着）。
     if let Some(relay_hash) = relay_reported {
-        // 期望与推送同源（relay_expected 收口纪律）：聚合指纹含全部 unit 的
-        // sha256，任一 unit 漂移/增删都会改聚合，对账语义与旧单文件等价。
-        // 占位 unit 也算已收敛态——否则本机无规则时每 60s 重推并重启。
-        let (_, want) = relay_expected(app, server_id)?;
-        if want != relay_hash {
-            let pushed = reconcile_relay_push(app, server_id)?;
-            eprintln!("[hash] relay reconcile: want={:?} got={:?} pushed={}", want, relay_hash, pushed);
-            let _ = pushed;
-        } else if server_id != 0 {
-            // 聚合指纹恒非空（空清单=sha256("")），收敛即每拍 poke 确保拉起：
-            // relay_hash 只对盘上指纹、看不到运行态，agent 侧 is-active 幂等
-            // 兜着；期望为空清单时 poke 是无 unit 的空转，天然无操作。
-            // 独立方法（批次1b）：只拉起不碰配置。曾借道 relay.apply 靠
-            // __noop__+空sha+ensure_started 三个魔法字段区分——一个 RPC
-            // 两个操作，调用者要背检查顺序（__noop__ 字面量曾被旧版当
-            // 配置写盘损坏 realm.toml）。
-            if let Err(e) = crate::agent_ws::call_agent(
-                app,
-                server_id,
-                "relay.ensure_started",
-                serde_json::json!({}),
-                Duration::from_secs(1),
-            )
-            .await
-            {
-                // warn 而非 debug：这条坏了意味着「拉活」失效而面板一切照常
-                // （is-active 事故的教训：静默的成功/无日志的失败让链路断了
-                // 数周无人知）——坏着时每 60s 一条正是该吵的时候；成功静默。
-                warn!("node {server_id}: relay ensure-started poke failed: {e:#}");
-            }
-        }
+        reconcile_family(
+            app,
+            server_id,
+            relay_hash,
+            Family {
+                tag: "relay",
+                expected: &|app, sid| relay_expected(app, sid).map(|(_, h)| h),
+                push: &|app, sid| reconcile_relay_push(app, sid).map(|_| ()),
+                ensure_install: &|_app, _sid| Box::pin(async { Ok(()) }),
+                poke_method: "relay.ensure_started",
+                // relay 的聚合指纹恒非空（空清单=sha256("")），poke 不看期望空满
+                // ——空清单时 poke 是无 unit 的空转，天然无操作。
+                poke_when_empty: true,
+            },
+        )
+        .await?;
     }
-    // gost 对账（隧道模块）：与 relay 同款语义——期望来自 gost_expected（与
-    // 推送同源），不一致重推；一致且期望非空 → 每拍 poke 确保拉起（agent
-    // 侧 is-active 幂等兜着）。旧 agent 不带 gost_hash → None 跳过。
+    // gost 对账（隧道模块）：同一骨架，差异只在期望来源、推送函数、补装与
+    // 「空期望=停服不 poke」（旧 agent 不带 gost_hash → None 跳过）。
     if let Some(gost_hash) = gost_reported {
-        let (_, want) = crate::gost::gost_expected(app, server_id)?;
-        let desired_running = !want.is_empty();
-        if want != gost_hash {
-            // 未收敛：先把二进制补齐（缓存命中时是零开销早退），再推配置。
-            // 首次建规则时 API 端的安装可能随客户端断开被 drop——对账是
-            // 它的兜底，只推不装会让 agent 每 60s 撞一次「尚未安装」。
-            if let Err(e) = crate::gost::ensure_remote_gost(app, server_id).await {
-                warn!("node {server_id}: gost ensure-install failed: {e:#}");
-            }
-            let pushed = crate::gost::reconcile_gost_push(app, server_id)?;
-            eprintln!("[hash] gost reconcile: want={want:?} got={gost_hash:?} pushed={pushed}");
-        } else if desired_running && server_id != 0 {
-            if let Err(e) = crate::agent_ws::call_agent(
-                app,
-                server_id,
-                "gost.ensure_started",
-                serde_json::json!({}),
-                Duration::from_secs(1),
-            )
-            .await
-            {
-                warn!("node {server_id}: gost ensure-started poke failed: {e:#}");
-            }
-        }
+        reconcile_family(
+            app,
+            server_id,
+            gost_hash,
+            Family {
+                tag: "gost",
+                expected: &|app, sid| crate::gost::gost_expected(app, sid).map(|(_, h)| h),
+                push: &|app, sid| crate::gost::reconcile_gost_push(app, sid).map(|_| ()),
+                ensure_install: &|app, sid| {
+                    Box::pin(async move {
+                        // 未收敛先把二进制补齐（缓存命中时是零开销早退）。首次建规则
+                        // 时 API 端的安装可能随客户端断开被 drop——对账是它的兜底，
+                        // 只推不装会让 agent 每 60s 撞一次「尚未安装」。
+                        crate::gost::ensure_remote_gost(app, sid).await
+                    })
+                },
+                poke_method: "gost.ensure_started",
+                // gost 空期望=停服清文件，不 poke（与 relay 占位语义不同）。
+                poke_when_empty: false,
+            },
+        )
+        .await?;
     }
     if let Some((_, desired)) = rendered {
         if desired == reported {
@@ -5171,7 +5219,18 @@ mod relay_render_tests {
         });
 
         // 真实心跳形状：relay_hash 恒在（无配置时空串）。
-        on_agent_hash_ext(&app, 2, "stale-singbox-hash", Some(""), None, Some("1.14.2"), None).await.unwrap();
+        on_agent_hash_ext(
+            &app,
+            2,
+            Heartbeat {
+                reported: "stale-singbox-hash",
+                relay_reported: Some(""),
+                version: Some("1.14.2"),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
 
         // relay.apply 已推给机器 2（fire-and-forget,等桩消费到再断言）。
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
@@ -5233,7 +5292,13 @@ mod relay_render_tests {
         // 消费帧，桩的状态更新才发生在下一拍之前。
         for _ in 0..3 {
             let hash = reported.lock().unwrap().clone();
-            on_agent_hash_ext(&app, 2, "", Some(&hash), None, None, None).await.unwrap();
+            on_agent_hash_ext(
+                &app,
+                2,
+                Heartbeat { reported: "", relay_reported: Some(&hash), ..Default::default() },
+            )
+            .await
+            .unwrap();
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         }
 
@@ -5291,7 +5356,13 @@ mod relay_render_tests {
         // 上报指纹与期望完全一致（收敛）：唯一该发生的动作就是拉活 poke。
         let (_, want) = relay_expected(&app, 2).unwrap();
         assert!(!want.is_empty(), "机器 2 有备用腿，期望指纹非空");
-        on_agent_hash_ext(&app, 2, "", Some(&want), None, None, None).await.unwrap();
+        on_agent_hash_ext(
+            &app,
+            2,
+            Heartbeat { reported: "", relay_reported: Some(&want), ..Default::default() },
+        )
+        .await
+        .unwrap();
 
         // poke 走 call_agent 等应答，函数返回时帧必已被桩消费并记账。
         let got = pokes.lock().unwrap();

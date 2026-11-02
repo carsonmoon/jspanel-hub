@@ -3520,13 +3520,13 @@ pub async fn proxy_traffic(_: Admin, State(app): State<Shared>) -> Response {
             let bundles = app.db.proxy_node_bundles().unwrap_or_default();
             let list: Vec<Value> = rows
                 .iter()
-                .filter_map(|(server_id, tag, trx, ttx, arx, atx)| {
+                .filter_map(|t| {
                     // 已删节点的残留采样不显示（同概览排行的口径）。
-                    let node = tag_bundle(&bundles, *server_id, tag)?.node.name.clone();
+                    let node = tag_bundle(&bundles, t.server_id, &t.tag)?.node.name.clone();
                     Some(json!({
                         "node": node,
-                        "today_rx": trx, "today_tx": ttx,
-                        "total_rx": arx, "total_tx": atx,
+                        "today_rx": t.today_rx, "today_tx": t.today_tx,
+                        "total_rx": t.total_rx, "total_tx": t.total_tx,
                     }))
                 })
                 .collect();
@@ -3709,7 +3709,7 @@ pub async fn proxy_overview(_: Admin, State(app): State<Shared>, Query(q): Query
             .db
             .traffic_series(since, bucket, series_shift)?
             .into_iter()
-            .map(|(bucket, rx, tx)| json!({ "bucket": bucket, "rx": rx, "tx": tx }))
+            .map(|b| json!({ "bucket": b.bucket, "rx": b.rx, "tx": b.tx }))
             .collect();
 
         // 监控节点表一次取齐：计费口径查找、续费日历、KPI 在线数共用。
@@ -3741,7 +3741,7 @@ pub async fn proxy_overview(_: Admin, State(app): State<Shared>, Query(q): Query
             .db
             .traffic_series(midnight, 3600, 0)?
             .into_iter()
-            .map(|(bucket, rx, tx)| json!({ "bucket": bucket, "rx": rx, "tx": tx }))
+            .map(|b| json!({ "bucket": b.bucket, "rx": b.rx, "tx": b.tx }))
             .collect();
 
         // 每日计费流量（近 30 天）：先按 日×节点 聚合，再按各节点的计费口径
@@ -3749,11 +3749,11 @@ pub async fn proxy_overview(_: Admin, State(app): State<Shared>, Query(q): Query
         let daily_raw = app.db.traffic_daily_node(now - 30 * 86_400)?;
         let mut daily_map: std::collections::BTreeMap<String, (i64, i64, i64)> =
             std::collections::BTreeMap::new();
-        for (day, server_id, _tag, rx, tx) in daily_raw {
-            let e = daily_map.entry(day).or_insert((0, 0, 0));
-            e.0 += rx;
-            e.1 += tx;
-            e.2 += billed(rx, tx, &mode_of_server(server_id));
+        for r in daily_raw {
+            let e = daily_map.entry(r.day).or_insert((0, 0, 0));
+            e.0 += r.rx;
+            e.1 += r.tx;
+            e.2 += billed(r.rx, r.tx, &mode_of_server(r.server_id));
         }
         let daily: Vec<Value> = daily_map
             .into_iter()
@@ -3764,20 +3764,20 @@ pub async fn proxy_overview(_: Admin, State(app): State<Shared>, Query(q): Query
         // 跨机镜像的同节点（切换主机）按节点归并求和，不再同名两行；
         // 计费各行先按所在机的口径折算再累加。
         let nodes = app.db.proxy_node_bundles()?;
-        let merge_rank = |rows: Vec<(i64, String, i64, i64)>, with_billed: bool| -> Vec<Value> {
+        let merge_rank = |rows: Vec<crate::db::TrafficNodeRankRow>, with_billed: bool| -> Vec<Value> {
             // key → (节点名, rx, tx, billed, mode)
             let mut map: std::collections::BTreeMap<String, (String, i64, i64, i64, String)> =
                 std::collections::BTreeMap::new();
-            for (server_id, tag, rx, tx) in rows {
+            for r in rows {
                 // 解析不到节点的 tag = 已删节点的残留采样：按用户口径直接
                 // 跳过，不再以「节点可能已删除」占行。
-                let Some(b) = tag_bundle(&nodes, server_id, &tag) else { continue };
+                let Some(b) = tag_bundle(&nodes, r.server_id, &r.tag) else { continue };
                 let (key, name) = (format!("n{}", b.node.id), b.node.name.clone());
-                let mode = mode_of_server(server_id);
-                let billed = if with_billed { billed(rx, tx, &mode) } else { 0 };
+                let mode = mode_of_server(r.server_id);
+                let billed = if with_billed { billed(r.rx, r.tx, &mode) } else { 0 };
                 let e = map.entry(key).or_insert((name, 0, 0, 0, mode));
-                e.1 += rx;
-                e.2 += tx;
+                e.1 += r.rx;
+                e.2 += r.tx;
                 e.3 += billed;
             }
             map.into_values()
@@ -3801,10 +3801,10 @@ pub async fn proxy_overview(_: Admin, State(app): State<Shared>, Query(q): Query
             .db
             .sub_usage_rank(since)?
             .into_iter()
-            .filter_map(|(sub_id, up, down)| {
-                let s = subs.iter().find(|s| s.id == sub_id)?;
+            .filter_map(|r| {
+                let s = subs.iter().find(|s| s.id == r.sub_user_id)?;
                 Some(json!({
-                    "name": s.name, "up": up, "down": down,
+                    "name": s.name, "up": r.up, "down": r.down,
                     "quota_bytes": s.quota_bytes, "status": crate::proxy::sub_status(s, crate::proxy::today()).label(),
                 }))
             })
@@ -3836,8 +3836,8 @@ pub async fn proxy_overview(_: Admin, State(app): State<Shared>, Query(q): Query
 
         // KPI：今日全网、在线节点（agents map 与监控节点交集）、客户数。
         let traffic = app.db.proxy_traffic()?;
-        let today_rx: i64 = traffic.iter().map(|t| t.2).sum();
-        let today_tx: i64 = traffic.iter().map(|t| t.3).sum();
+        let today_rx: i64 = traffic.iter().map(|t| t.today_rx).sum();
+        let today_tx: i64 = traffic.iter().map(|t| t.today_tx).sum();
         let online = app.agents.read().unwrap_or_else(|e| e.into_inner()).keys().copied().collect::<Vec<_>>();
         let total_nodes = all_nodes.len();
         let online_nodes = all_nodes.iter().filter(|n| online.contains(&n.id)).count();
@@ -4147,9 +4147,20 @@ async fn normalize_relay_rule(
     }
     rule.name = rule.name.trim().to_owned();
     rule.listen_port = rule.listen_port.trim().to_owned();
-    // 监听端口留空：两种模式都允许，端口池内自动分配。
+    // 监听端口留空：两种模式都允许，端口池内自动分配（分配器口径已含镜像）。
     if rule.listen_port.is_empty() || rule.listen_port == "0" {
         rule.listen_port = proxy::allocate_relay_port(app, rule.server_id)?.to_string();
+    } else if proxy::relay_port_taken(
+        app,
+        rule.server_id,
+        rule.listen_port.parse().unwrap_or(0),
+        except_rule,
+    )? {
+        // 手工指定同样查占用（候选 4：此前入口端口零检查，可与节点/转发/隧道相撞）。
+        anyhow::bail!(crate::Shown(format!(
+            "入口机端口 {} 已被占用（节点或其他转发规则）",
+            rule.listen_port
+        )));
     }
     if rule.protocol.is_empty() {
         rule.protocol = "both".into();
@@ -5092,7 +5103,7 @@ mod tests {
         ins(now - 31 * 86_400, 999, 999);
         let rows = app.db.traffic_daily_node(now - 30 * 86_400).unwrap();
         let by_day: std::collections::HashMap<String, (i64, i64)> =
-            rows.into_iter().map(|(d, _, _, rx, tx)| (d, (rx, tx))).collect();
+            rows.into_iter().map(|r| (r.day, (r.rx, r.tx))).collect();
         assert_eq!(by_day.len(), 2, "窗口内应只有两个自然日: {by_day:?}");
         let today_key = Local::now().date_naive().format("%Y-%m-%d").to_string();
         let yesterday_key =

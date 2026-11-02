@@ -535,7 +535,7 @@ mod tests {
         });
 
         // 未收敛：agent 上报空指纹 → 重推 gost.apply。
-        crate::proxy::on_agent_hash_ext(&app, 1, "", None, None, None, None).await.unwrap();
+        crate::proxy::on_agent_hash_ext(&app, 1, crate::proxy::Heartbeat::default()).await.unwrap();
         // 收敛但没跑的 poke 分支在 agent_ws 桩侧不好观测（call_agent 应答已
         // 由上面 responder 兜住），这里验证收敛路径不推配置：
         let (want, _) = gost_expected(&app, 1).unwrap();
