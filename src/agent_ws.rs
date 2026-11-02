@@ -511,8 +511,16 @@ fn dispatch(
             let id = rpc.id.clone().unwrap_or_default();
             if let Some(sender) = app.proxy_rpcs.lock().unwrap_or_else(|e| e.into_inner()).remove(&id) {
                 if let Some(err) = &rpc.error {
+                    let code = err.get("code").and_then(|v| v.as_str()).unwrap_or("");
                     let message = err.get("message").and_then(|v| v.as_str()).unwrap_or("agent 报错");
-                    let _ = sender.send(Err(message.to_owned()));
+                    // agent deny 回帧（2026-11-02 起）：老 hub 对新 agent 的方法
+                    // 会收到 UNKNOWN_METHOD——面板文案改成可操作的升级提示。
+                    let message = if code == "UNKNOWN_METHOD" {
+                        "节点程序过旧，请升级节点程序".to_owned()
+                    } else {
+                        message.to_owned()
+                    };
+                    let _ = sender.send(Err(message));
                 } else {
                     let _ = sender.send(Ok(rpc.result.unwrap_or(rpc.params)));
                 }
@@ -1626,5 +1634,38 @@ mod tests {
         assert!(send(&app, id, &mut session, 0, "not json").is_err());
         // Unknown methods are ignored.
         assert!(send(&app, id, &mut session, 0, r#"{"method":"whatever"}"#).is_ok());
+    }
+
+    /// agent deny 回帧（UNKNOWN_METHOD）的文案改写：老 hub 面板收到的是
+    /// 可操作的升级提示，而非裸的「未知方法 xxx」；其他错误码原样透传。
+    #[test]
+    fn an_unknown_method_reply_becomes_an_upgrade_hint() {
+        let app = app();
+        let (node_id, _) = connect(&app);
+        let mut session = Session::default();
+
+        let (tx, rx) = tokio::sync::oneshot::channel::<Result<serde_json::Value, String>>();
+        let rpc_id = "rpc-1".to_owned();
+        app.proxy_rpcs.lock().unwrap().insert(rpc_id.clone(), tx);
+
+        let frame = json!({
+            "jsonrpc": "2.0", "id": rpc_id,
+            "error": {"code": "UNKNOWN_METHOD", "message": "未知方法 shaper.apply"}
+        })
+        .to_string();
+        send(&app, node_id, &mut session, 0, &frame).unwrap();
+        let message = rx.blocking_recv().unwrap().unwrap_err();
+        assert_eq!(message, "节点程序过旧，请升级节点程序");
+
+        // 其他错误码原样透传，不被改写。
+        let (tx, rx) = tokio::sync::oneshot::channel::<Result<serde_json::Value, String>>();
+        app.proxy_rpcs.lock().unwrap().insert("rpc-2".to_owned(), tx);
+        let frame = json!({
+            "jsonrpc": "2.0", "id": "rpc-2",
+            "error": {"code": "PROXY_ERROR", "message": "配置指纹不符"}
+        })
+        .to_string();
+        send(&app, node_id, &mut session, 0, &frame).unwrap();
+        assert_eq!(rx.blocking_recv().unwrap().unwrap_err(), "配置指纹不符");
     }
 }
