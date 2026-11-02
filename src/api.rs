@@ -4229,7 +4229,16 @@ async fn server_realm_status(app: &App, server_id: i64, name: String) -> Value {
         };
         let desired = proxy::realm_desired_running(app);
         let running = if installed && !version.is_empty() && desired {
-            if std::path::Path::new("/run/systemd/system").exists() {
+            if proxy::local_node_server_id(app).is_some() {
+                // 本机同时是 agent 节点：realm 归 agent 单写（apply_relay_local
+                // 改道 relay.apply），实际跑的是 monitor-realm-api 单进程实例，
+                // 状态探测跟 agent 同口径。旧协议的 monitor-realm@main 只在
+                // 本机无 agent 的退化形态（apply_relay_local 直写路径）存在。
+                matches!(
+                    tokio::process::Command::new("systemctl").args(["is-active", "--quiet", "monitor-realm-api"]).output().await,
+                    Ok(o) if o.status.success()
+                )
+            } else if std::path::Path::new("/run/systemd/system").exists() {
                 matches!(
                     tokio::process::Command::new("systemctl").args(["is-active", "--quiet", "monitor-realm@main"]).output().await,
                     Ok(o) if o.status.success()
