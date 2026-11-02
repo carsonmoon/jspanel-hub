@@ -116,6 +116,10 @@ export function GostRuleDialog({ open, onOpenChange, editing, servers, portPool,
         .filter((l) => !l.startsWith(":") && !l.endsWith(":") && l !== ":")
         .join("\n")
       const base = {
+        // PUT 全量语义（漏键=serde default 清掉）：从 editing 展开再覆盖表单
+        // 字段——新增后端字段不再可能被手拼字面量漏带（Gost toggle 漏 enabled
+        // 是 tsc 侥幸抓住的先例）。
+        ...(editing ?? { enabled: true }),
         server_id: Number(draft.serverId),
         name: draft.name.trim(),
         exit_server_id: draft.tunnel ? Number(draft.exitServerId) : 0,

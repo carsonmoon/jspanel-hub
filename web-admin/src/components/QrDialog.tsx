@@ -3,15 +3,15 @@ import QRCode from "qrcode"
 import { toast } from "sonner"
 
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from "@/components/ui/dialog"
+import { copyToClipboard } from "@/lib/utils"
 
 // what 拼在「已复制」之后，调用方传裸名词（如「分享链接」），勿自带前缀；展示具体值时以空格开头（` ${ip}`）。
+// 剪贴板实现收敛在 lib/utils（copyToClipboard，含 http 回退）；此别名维持
+// 旧导入面（Tunnel/Users/Proxy/Gost 从这里 import copy）不动。
 export async function copy(text: string, what: string) {
-  try {
-    await navigator.clipboard.writeText(text)
-    toast.success(`已复制${what}`)
-  } catch {
-    toast.error("复制失败，请手动复制")
-  }
+  const ok = await copyToClipboard(text)
+  if (ok) toast.success(`已复制${what}`)
+  else toast.error("复制失败，请手动复制")
 }
 
 export function QrDialog({ url, name, kind, onOpenChange, extra }: { url: string; name: string; kind: "node" | "subscription"; onOpenChange: (v: boolean) => void; /** 可选扩展区（订阅页：地址栏+客户端格式+分发入口），出现在二维码下方。 */ extra?: React.ReactNode }) {

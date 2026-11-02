@@ -9,6 +9,7 @@ import { useEffect, useState } from "react"
 import QRCode from "qrcode"
 
 import { StatusBadge } from "@/components/ui/status-badge"
+import { copyToClipboard as copyText } from "@/lib/utils"
 
 declare const __USER_BASE__: string
 
@@ -51,28 +52,9 @@ function gb(bytes: number) {
   return `${(bytes / 1024 ** 3).toFixed(2)} GB`
 }
 
-// 复制到剪贴板：clipboard API 优先（需用户激活），被拒（老内核/App 内置
-// webview 常见）退化 execCommand 临时选区方案。返回是否成功。
-async function copyText(text: string): Promise<boolean> {
-  try {
-    await navigator.clipboard.writeText(text)
-    return true
-  } catch {
-    try {
-      const ta = document.createElement("textarea")
-      ta.value = text
-      ta.style.position = "fixed"
-      ta.style.opacity = "0"
-      document.body.appendChild(ta)
-      ta.select()
-      const ok = document.execCommand("copy")
-      ta.remove()
-      return ok
-    } catch {
-      return false
-    }
-  }
-}
+// 剪贴板实现收敛在 lib/utils（copyToClipboard：clipboard API 优先，被拒退化
+// execCommand；返回是否成功）。/u/ 独立 bundle 不 import lib/api 的纪律不变——
+// utils 只含工具函数，且 StatusBadge→badge→cn 已间接依赖它。
 
 // ① 流量配额（仅概览模式；代理明细模式下逐代理卡已覆盖流量信息）。
 // 订阅二维码收编到卡头（概览模式不再单设订阅链接卡；取首个订阅入口）

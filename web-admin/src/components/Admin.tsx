@@ -18,6 +18,7 @@ import { Skeleton } from "@/components/ui/skeleton"
 import { StatusBadge } from "@/components/ui/status-badge"
 import { api, badIfaceName, behind, changes, configFields, configForm, configOverrides, configSections, configValues, currentIface, fits, GIB, groupsOf, ifaceChoice, ifaceSpec, inGroup, outdatedAgents, provisioningSite, shortAddress, trafficCorrection, upload, type ConfigField, type IfaceChoice, type Node, type PingTask, type Source } from "@/lib/api"
 import { bytes, cycleMonths, FOREVER, money, uptime } from "@/lib/format"
+import { copyText as copy } from "@/lib/utils"
 
 import Proxy from "@/components/Proxy"
 import Overview from "@/components/Overview"
@@ -199,22 +200,6 @@ function DragHandle({ name, disabled, title = "拖动排序", ...events }: React
     >
       <GripVertical className="size-4" />
     </button>
-  )
-}
-
-function copy(text: string, done = "已复制") {
-  // navigator.clipboard exists only in a secure context. Over plain http the
-  // copy command still works from a click, the clipboard filled from its event.
-  if (!navigator.clipboard) {
-    const put = (e: ClipboardEvent) => { e.clipboardData?.setData("text/plain", text); e.preventDefault() }
-    document.addEventListener("copy", put)
-    const ok = document.execCommand("copy")
-    document.removeEventListener("copy", put)
-    return ok ? toast.success(done) : toast.error("复制失败")
-  }
-  navigator.clipboard.writeText(text).then(
-    () => toast.success(done),
-    () => toast.error("复制失败"),
   )
 }
 

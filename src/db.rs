@@ -2868,6 +2868,76 @@ pub struct McpOperation {
     pub lease: String,
 }
 
+// ---- 命名行结构体（候选 2 批次：热点表的查询返回）----
+// SELECT 列序 ↔ 元组位置是编译器不可见契约，同款列序错已两次实咬
+// （mcp_operations 第 4/5 位写反、proxy_user_ids_of_names 读错列且被
+// if let Ok 吞掉）。这批结构体把列序变编译期对账；先例 McpOperation。
+
+/// [`Db::sub_usage_rank`] 的一行：客户用量排行。
+#[derive(Debug, Clone, PartialEq)]
+pub struct SubUsageRankRow {
+    pub sub_user_id: i64,
+    pub up: i64,
+    pub down: i64,
+}
+
+/// [`Db::traffic_series`] 的一行：走势图的一个时间桶。
+#[derive(Debug, Clone, PartialEq)]
+pub struct TrafficBucket {
+    /// 桶起点（真实 unix 秒，shift 已减回）。
+    pub bucket: i64,
+    pub rx: i64,
+    pub tx: i64,
+}
+
+/// [`Db::traffic_node_rank`] 的一行：按节点的流量排行。
+#[derive(Debug, Clone)]
+pub struct TrafficNodeRankRow {
+    pub server_id: i64,
+    /// 采样行的节点标签（节点名由调用方经 tag_bundle 映射）。
+    pub tag: String,
+    pub rx: i64,
+    pub tx: i64,
+}
+
+/// [`Db::traffic_daily_node`] 的一行：日×节点聚合。
+#[derive(Debug, Clone)]
+pub struct TrafficDailyRow {
+    /// 本地日期（`date(ts,'unixepoch','localtime')`）。
+    pub day: String,
+    pub server_id: i64,
+    pub tag: String,
+    pub rx: i64,
+    pub tx: i64,
+}
+
+/// [`Db::proxy_traffic`] 的一行：节点流量合计（今日与累计）。
+#[derive(Debug, Clone)]
+pub struct ProxyTrafficRow {
+    pub server_id: i64,
+    pub tag: String,
+    pub today_rx: i64,
+    pub today_tx: i64,
+    pub total_rx: i64,
+    pub total_tx: i64,
+}
+
+/// [`Db::proxy_sub_of_names`] 的一行：凭据名 → 绑定的订阅客户（记账定位）。
+#[derive(Debug, Clone)]
+pub struct ProxySubOfName {
+    pub name: String,
+    /// None = 未绑定客户（凭据级记账照走，订阅级跳过）。
+    pub sub_user_id: Option<i64>,
+}
+
+/// [`Db::proxy_user_ids_of_names`] 的一行：凭据名 → proxy_user.id（凭据级
+/// 记账定位；列序错曾让整条链路自上线起从未工作）。
+#[derive(Debug, Clone)]
+pub struct ProxyUserIdOfName {
+    pub name: String,
+    pub proxy_user_id: i64,
+}
+
 impl Db {
     pub fn open(path: &str) -> Result<Self> {
         let conn = Connection::open(path)?;
@@ -3599,14 +3669,16 @@ impl Db {
     /// 按总量降序前 10。返回 (sub_user_id, up, down)，名字/配额由调用方映射。
     /// 桶是整点对齐的，窗口起点所在的那个桶整桶计入（≤1h 粒度误差，与走势
     /// 图同宽容度）。
-    pub fn sub_usage_rank(&self, since: i64) -> Result<Vec<(i64, i64, i64)>> {
+    pub fn sub_usage_rank(&self, since: i64) -> Result<Vec<SubUsageRankRow>> {
         let conn = self.conn();
         let mut stmt = conn.prepare(
             "SELECT sub_user_id, COALESCE(SUM(up),0), COALESCE(SUM(down),0)
              FROM sub_usage_hourly WHERE bucket >= ?1
              GROUP BY sub_user_id ORDER BY SUM(up)+SUM(down) DESC LIMIT 10",
         )?;
-        let rows = stmt.query_map([since], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+        let rows = stmt.query_map([since], |r| {
+            Ok(SubUsageRankRow { sub_user_id: r.get(0)?, up: r.get(1)?, down: r.get(2)? })
+        })?;
         Ok(rows.collect::<Result<_, _>>()?)
     }
 
@@ -3652,7 +3724,7 @@ impl Db {
     /// 一台服务器上凭据用户名 → 所属客户的映射，用户级流量记账用。同一
     /// 服务器的用户名必须唯一（v2ray 计数器按名字聚合，重名会合并用量），
     /// 创建入口已保证；这里重名取先者，旧行为兜底。
-    pub fn proxy_sub_of_names(&self, server_id: i64, names: &[String]) -> Result<Vec<(String, Option<i64>)>> {
+    pub fn proxy_sub_of_names(&self, server_id: i64, names: &[String]) -> Result<Vec<ProxySubOfName>> {
         let conn = self.conn();
         let mut out = Vec::new();
         let mut stmt = conn.prepare(
@@ -3663,13 +3735,17 @@ impl Db {
         for name in names {
             let sub_id =
                 stmt.query_row(params![server_id, name], |r| r.get::<_, Option<i64>>(1)).optional()?;
-            out.push((name.clone(), sub_id.flatten()));
+            out.push(ProxySubOfName { name: name.clone(), sub_user_id: sub_id.flatten() });
         }
         Ok(out)
     }
 
     /// 凭据级记账的定位：server 上这批凭据名 → proxy_user.id（方向 40）。
-    pub fn proxy_user_ids_of_names(&self, server_id: i64, names: &[String]) -> Result<Vec<(String, i64)>> {
+    pub fn proxy_user_ids_of_names(
+        &self,
+        server_id: i64,
+        names: &[String],
+    ) -> Result<Vec<ProxyUserIdOfName>> {
         let conn = self.conn();
         let mut out = Vec::new();
         let mut stmt = conn.prepare(
@@ -3684,7 +3760,7 @@ impl Db {
             if let Ok(Some(pu_id)) =
                 stmt.query_row(params![server_id, name], |r| r.get::<_, i64>(1)).optional()
             {
-                out.push((name.clone(), pu_id));
+                out.push(ProxyUserIdOfName { name: name.clone(), proxy_user_id: pu_id });
             }
         }
         Ok(out)
@@ -3739,14 +3815,15 @@ impl Db {
     /// 30d/天桶）。
     /// shift：桶对齐的时区偏移秒数（日桶对齐本地零点用；小时/分钟桶在
     /// 东八区天然对齐，传 0）。返回的桶键已减回 shift，仍是真实 unix 秒。
-    pub fn traffic_series(&self, since: i64, bucket_secs: i64, shift: i64) -> Result<Vec<(i64, i64, i64)>> {
+    pub fn traffic_series(&self, since: i64, bucket_secs: i64, shift: i64) -> Result<Vec<TrafficBucket>> {
         let conn = self.conn();
         let mut stmt = conn.prepare(
             "SELECT ((ts + ?3)/?2)*?2 - ?3, COALESCE(SUM(rx),0), COALESCE(SUM(tx),0)
              FROM traffic_samples WHERE ts >= ?1 GROUP BY (ts + ?3)/?2 ORDER BY (ts + ?3)/?2",
         )?;
-        let rows =
-            stmt.query_map(params![since, bucket_secs, shift], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+        let rows = stmt.query_map(params![since, bucket_secs, shift], |r| {
+            Ok(TrafficBucket { bucket: r.get(0)?, rx: r.get(1)?, tx: r.get(2)? })
+        })?;
         Ok(rows.collect::<Result<_, _>>()?)
     }
 
@@ -3776,14 +3853,16 @@ impl Db {
 
     /// 按节点的流量排行（概览，窗口随调用方传的 since——与走势同范围）：
     /// 返回 (server_id, tag, rx, tx)，节点名由调用方映射。按总量降序。
-    pub fn traffic_node_rank(&self, since: i64) -> Result<Vec<(i64, String, i64, i64)>> {
+    pub fn traffic_node_rank(&self, since: i64) -> Result<Vec<TrafficNodeRankRow>> {
         let conn = self.conn();
         let mut stmt = conn.prepare(
             "SELECT server_id, node_tag, COALESCE(SUM(rx),0), COALESCE(SUM(tx),0)
              FROM traffic_samples WHERE ts >= ?1
              GROUP BY server_id, node_tag ORDER BY SUM(rx)+SUM(tx) DESC",
         )?;
-        let rows = stmt.query_map([since], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?;
+        let rows = stmt.query_map([since], |r| {
+            Ok(TrafficNodeRankRow { server_id: r.get(0)?, tag: r.get(1)?, rx: r.get(2)?, tx: r.get(3)? })
+        })?;
         Ok(rows.collect::<Result<_, _>>()?)
     }
 
@@ -4259,7 +4338,7 @@ impl Db {
     /// （如东八区）日界仍精确，非整点时区最老一天可有 ≤1h 误差（与 30d
     /// 档既有口径一致）。无流量之日无行，由调用方补零。
     #[allow(clippy::type_complexity)] // 四元组返回是日账单行的既定形态
-    pub fn traffic_daily_node(&self, since: i64) -> Result<Vec<(String, i64, String, i64, i64)>> {
+    pub fn traffic_daily_node(&self, since: i64) -> Result<Vec<TrafficDailyRow>> {
         let conn = self.conn();
         let mut stmt = conn.prepare(
             "SELECT date(ts, 'unixepoch', 'localtime') AS d, server_id, node_tag,
@@ -4267,8 +4346,15 @@ impl Db {
              FROM traffic_samples WHERE ts >= ?1
              GROUP BY d, server_id, node_tag ORDER BY d",
         )?;
-        let rows =
-            stmt.query_map([since], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)))?;
+        let rows = stmt.query_map([since], |r| {
+            Ok(TrafficDailyRow {
+                day: r.get(0)?,
+                server_id: r.get(1)?,
+                tag: r.get(2)?,
+                rx: r.get(3)?,
+                tx: r.get(4)?,
+            })
+        })?;
         Ok(rows.collect::<Result<_, _>>()?)
     }
 
@@ -4416,8 +4502,7 @@ impl Db {
 
     /// 每个节点的流量合计：今日（本地时区自然日）与累计。
     #[allow(clippy::type_complexity)] // 六元组即排行榜行，拆别名反而隔一层
-    pub fn proxy_traffic(&self) -> Result<Vec<(i64, String, i64, i64, i64, i64)>> {
-        // (server_id, tag, today_rx, today_tx, total_rx, total_tx)
+    pub fn proxy_traffic(&self) -> Result<Vec<ProxyTrafficRow>> {
         let conn = self.conn();
         let day_start = Local::now().date_naive().and_hms_opt(0, 0, 0).unwrap().and_utc().timestamp();
         let mut stmt = conn.prepare(
@@ -4428,7 +4513,14 @@ impl Db {
              FROM traffic_samples GROUP BY server_id, node_tag",
         )?;
         let rows = stmt.query_map([day_start], |r| {
-            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?))
+            Ok(ProxyTrafficRow {
+                server_id: r.get(0)?,
+                tag: r.get(1)?,
+                today_rx: r.get(2)?,
+                today_tx: r.get(3)?,
+                total_rx: r.get(4)?,
+                total_tx: r.get(5)?,
+            })
         })?;
         Ok(rows.collect::<Result<_, _>>()?)
     }
@@ -7237,10 +7329,16 @@ mod tests {
         .unwrap();
 
         let hourly = db.traffic_series(base, 3600, 0).unwrap();
-        assert_eq!(hourly, vec![(base, 150, 15), (base + 3600, 7, 1)]);
+        assert_eq!(
+            hourly,
+            vec![
+                TrafficBucket { bucket: base, rx: 150, tx: 15 },
+                TrafficBucket { bucket: base + 3600, rx: 7, tx: 1 }
+            ]
+        );
 
         let six_hourly = db.traffic_series(base, 6 * 3600, 0).unwrap();
-        assert_eq!(six_hourly, vec![(base, 157, 16)]);
+        assert_eq!(six_hourly, vec![TrafficBucket { bucket: base, rx: 157, tx: 16 }]);
     }
 
     /// Counted directly from the table rather than read back through
@@ -8004,6 +8102,63 @@ mod tests {
         assert_eq!(db.proxy_node(id).unwrap().unwrap().ws_path, "");
     }
 
+    /// PUT 全量语义的 serde 守卫（候选 3）：面板 PUT /proxy/nodes/{id} 的 body
+    /// 就是 ProxyNode 的序列化形态——任何字段的 serde 改动（改名/去掉
+    /// default/加 skip_serializing）都会让面板带回来的值被静默重置。这里把
+    /// 满配节点序列化成 PUT body 再反序列化回来，逐字段断言不丢：serde 契约
+    /// 变了此测试必红，逼着同步改前端展开式（{...initial, ...form}）。
+    #[test]
+    fn proxy_node_put_body_round_trips_every_field() {
+        let full = ProxyNode {
+            id: 7,
+            name: "jp".into(),
+            protocol: "vless-reality".into(),
+            listen_port: 26615,
+            sni: "sni.example.com".into(),
+            flow: "xtls-rprx-vision".into(),
+            method: String::new(),
+            enabled: false,
+            remark: "备注".into(),
+            server_id: 3,
+            egress_type: "socks5".into(),
+            egress_host: "10.0.0.1".into(),
+            egress_port: 1080,
+            egress_username: "u".into(),
+            egress_password: "p".into(),
+            rate_up: 20,
+            rate_down: 50,
+            dns_name: "n1.example.com".into(),
+            ws_path: "/ws".into(),
+            dns_server_id: 2,
+            dns_ip: "203.0.113.10".into(),
+            ..Default::default()
+        };
+        let body = serde_json::to_value(&full).unwrap();
+        let back: ProxyNode = serde_json::from_value(body).unwrap();
+        assert_eq!(back.name, full.name);
+        assert_eq!(back.protocol, full.protocol);
+        assert_eq!(back.listen_port, full.listen_port);
+        assert_eq!(back.sni, full.sni);
+        assert_eq!(back.flow, full.flow);
+        assert_eq!(
+            back.enabled, full.enabled,
+            "enabled 缺 serde(default=\"yes\") 或被 skip 都会让停用节点被 PUT 复活"
+        );
+        assert_eq!(back.remark, full.remark);
+        assert_eq!(back.server_id, full.server_id);
+        assert_eq!(back.egress_type, full.egress_type);
+        assert_eq!(back.egress_host, full.egress_host);
+        assert_eq!(back.egress_port, full.egress_port);
+        assert_eq!(back.egress_username, full.egress_username);
+        assert_eq!(back.egress_password, full.egress_password);
+        assert_eq!(back.rate_up, full.rate_up);
+        assert_eq!(back.rate_down, full.rate_down);
+        assert_eq!(back.dns_name, full.dns_name);
+        assert_eq!(back.ws_path, full.ws_path);
+        assert_eq!(back.dns_server_id, full.dns_server_id);
+        assert_eq!(back.dns_ip, full.dns_ip);
+    }
+
     /// 删除节点必须显式带走 secret（含私钥/证书）与凭据：级联从未生效
     /// （hub 连接没开 PRAGMA foreign_keys），曾永久残留已删节点的私钥。
     #[test]
@@ -8060,8 +8215,8 @@ mod tests {
         let id = db.create_proxy_node(&node, &ProxySecret::default(), "cred").unwrap();
         let out = db.proxy_user_ids_of_names(3, &["default".to_owned(), "不存在".to_owned()]).unwrap();
         assert_eq!(out.len(), 1, "命中的凭据返回、未命中的跳过");
-        assert_eq!(out[0].0, "default");
-        assert!(out[0].1 > 0, "id 列真实读出（列序 bug 则恒空）");
+        assert_eq!(out[0].name, "default");
+        assert!(out[0].proxy_user_id > 0, "id 列真实读出（列序 bug 则恒空）");
         let _ = id;
     }
 
@@ -8093,9 +8248,9 @@ mod tests {
         unify_local_sampling_rows(&db.conn(), 7).unwrap();
         // 0 行全部归到 7；别的机器行不动。
         let traffic = db.proxy_traffic().unwrap();
-        assert!(traffic.iter().any(|(sid, tag, ..)| *sid == 7 && tag == "in-24001"), "{traffic:?}");
-        assert!(!traffic.iter().any(|(sid, ..)| *sid == 0), "0 身份应清零: {traffic:?}");
-        assert!(traffic.iter().any(|(sid, tag, ..)| *sid == 5 && tag == "in-24002"), "{traffic:?}");
+        assert!(traffic.iter().any(|t| t.server_id == 7 && t.tag == "in-24001"), "{traffic:?}");
+        assert!(!traffic.iter().any(|t| t.server_id == 0), "0 身份应清零: {traffic:?}");
+        assert!(traffic.iter().any(|t| t.server_id == 5 && t.tag == "in-24002"), "{traffic:?}");
         let (rows, _) =
             db.connection_logs(&ConnLogFilter { server_id: Some(7), ..Default::default() }).unwrap();
         assert_eq!(rows.len(), 1, "连接日志随身份归到 7");
@@ -8143,10 +8298,10 @@ mod tests {
 
         let traffic = db.proxy_traffic().unwrap();
         assert!(
-            traffic.iter().any(|(sid, tag, _, _, tr, _)| *sid == 3 && tag == "in-24002" && *tr == 100),
+            traffic.iter().any(|t| t.server_id == 3 && t.tag == "in-24002" && t.total_rx == 100),
             "samples follow the node to its new port: {traffic:?}"
         );
-        assert!(!traffic.iter().any(|(_, tag, ..)| tag == "in-24001"), "the old tag must not linger");
+        assert!(!traffic.iter().any(|t| t.tag == "in-24001"), "the old tag must not linger");
         let (rows, total) = db
             .connection_logs(&ConnLogFilter {
                 server_id: Some(3),
@@ -8181,31 +8336,34 @@ mod tests {
         ])
         .unwrap();
         let total_before: (i64, i64) =
-            db.proxy_traffic().unwrap().iter().fold((0, 0), |a, t| (a.0 + t.4, a.1 + t.5));
+            db.proxy_traffic().unwrap().iter().fold((0, 0), |a, t| (a.0 + t.total_rx, a.1 + t.total_tx));
 
         let removed = db.compact_traffic_samples(8).unwrap();
         assert_eq!(removed, 3, "the three misaligned old rows are rewritten");
 
         let total_after: (i64, i64) =
-            db.proxy_traffic().unwrap().iter().fold((0, 0), |a, t| (a.0 + t.4, a.1 + t.5));
+            db.proxy_traffic().unwrap().iter().fold((0, 0), |a, t| (a.0 + t.total_rx, a.1 + t.total_tx));
         assert_eq!(total_after, total_before, "compaction must not move a byte");
 
         let old_hour_rows: Vec<_> = db.traffic_series(old - 3600, 3600, 0).unwrap().into_iter().collect();
         assert!(
-            old_hour_rows.contains(&(base - 9 * 86_400, 150, 15)),
+            old_hour_rows.contains(&TrafficBucket { bucket: base - 9 * 86_400, rx: 150, tx: 15 }),
             "two samples folded into one hour row"
         );
-        assert!(old_hour_rows.contains(&(base - 9 * 86_400 + 3600, 7, 1)), "the next hour stays its own row");
+        assert!(
+            old_hour_rows.contains(&TrafficBucket { bucket: base - 9 * 86_400 + 3600, rx: 7, tx: 1 }),
+            "the next hour stays its own row"
+        );
 
         // 幂等：小时行整点对齐，二次运行无事可做。
         assert_eq!(db.compact_traffic_samples(8).unwrap(), 0);
         let total_again: (i64, i64) =
-            db.proxy_traffic().unwrap().iter().fold((0, 0), |a, t| (a.0 + t.4, a.1 + t.5));
+            db.proxy_traffic().unwrap().iter().fold((0, 0), |a, t| (a.0 + t.total_rx, a.1 + t.total_tx));
         assert_eq!(total_again, total_before);
 
         // 新采样未被触碰。
         let fresh_rows = db.traffic_series(fresh - 3600, 3600, 0).unwrap();
-        assert!(fresh_rows.iter().any(|(_, rx, tx)| *rx == 500 && *tx == 50));
+        assert!(fresh_rows.iter().any(|b| b.rx == 500 && b.tx == 50));
     }
 
     /// 客户小时汇总（迁移 23）：建表时从 connection_log 回填一次，此后记账
@@ -8247,12 +8405,18 @@ mod tests {
         .unwrap();
         assert!(db.sub_usage_rank(now - 3600).unwrap().is_empty());
         migrate_to_23(&db.conn()).unwrap();
-        assert_eq!(db.sub_usage_rank(now - 3600).unwrap(), vec![(sub, 111, 222)]);
+        assert_eq!(
+            db.sub_usage_rank(now - 3600).unwrap(),
+            vec![SubUsageRankRow { sub_user_id: sub, up: 111, down: 222 }]
+        );
 
         // 记账增量进同一小时的桶：两笔并成一行。
         db.bump_sub_usage(&[(sub, 100, 200)]).unwrap();
         db.bump_sub_usage(&[(sub, 10, 20)]).unwrap();
-        assert_eq!(db.sub_usage_rank(now - 3600).unwrap(), vec![(sub, 221, 442)]);
+        assert_eq!(
+            db.sub_usage_rank(now - 3600).unwrap(),
+            vec![SubUsageRankRow { sub_user_id: sub, up: 221, down: 442 }]
+        );
         assert!(db.sub_usage_rank(now + 3600).unwrap().is_empty(), "窗口起点之后才有的桶不计入");
 
         // 清理按保留期删桶：保留 0 天即全删。

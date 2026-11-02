@@ -271,7 +271,13 @@ function NodeDialog({ open, initial, servers, onOpenChange, reload }: {
   const save = async () => {
     setBusy(true)
     try {
-      const body: Record<string, unknown> = {
+      // PUT 全量语义（漏键=serde default 清掉）：从 initial 展开再覆盖表单字段，
+      // 表单没有的（enabled/remark/sni/method…）编辑时原样带回——此前 body 手拼
+      // 字面量漏掉 enabled，编辑停用节点保存即被静默重新启用（serde default=yes）。
+      const body: Record<string, unknown> = editing && initial
+        ? { ...initial, uuid: initial.uuid || "", reality_private_key: initial.reality_private_key || "" }
+        : { enabled: true }
+      const form: Record<string, unknown> = {
         name: name.trim(),
         protocol,
         server_id: serverId,
@@ -285,23 +291,24 @@ function NodeDialog({ open, initial, servers, onOpenChange, reload }: {
         egress_password: egressPass,
         dns_name: dnsName.trim(),
       }
-      if (NEEDS_SNI.has(protocol)) body.sni = sni.trim()
+      if (NEEDS_SNI.has(protocol)) form.sni = sni.trim()
       if (protocol === "vless-ws" || protocol === "vmess-ws") {
-        body.ws_path = wsPath.trim()
-        if (uuid.trim()) body.uuid = uuid.trim()
+        form.ws_path = wsPath.trim()
+        if (uuid.trim()) form.uuid = uuid.trim()
         // vmess-ws 明文回源零证书；证书对仅 vless-ws 有。
         if (protocol === "vless-ws" && certPem.trim() && keyPem.trim()) {
-          body.cert_pem = certPem.trim()
-          body.key_pem = keyPem.trim()
+          form.cert_pem = certPem.trim()
+          form.key_pem = keyPem.trim()
         }
       }
       if (protocol === "vless-reality") {
-        body.flow = flow === "none" ? "" : flow
-        if (uuid.trim()) body.uuid = uuid.trim()
-        if (privateKey.trim()) body.reality_private_key = privateKey.trim()
-        if (shortId.trim()) body.reality_short_id = shortId.trim()
+        form.flow = flow === "none" ? "" : flow
+        if (uuid.trim()) form.uuid = uuid.trim()
+        if (privateKey.trim()) form.reality_private_key = privateKey.trim()
+        if (shortId.trim()) form.reality_short_id = shortId.trim()
       }
-      if (protocol === "shadowsocks") body.method = method
+      if (protocol === "shadowsocks") form.method = method
+      Object.assign(body, form)
       if (editing) {
         await api(`/proxy/nodes/${initial!.id}`, { method: "PUT", body: JSON.stringify(body) })
         toast.success("代理已更新")
